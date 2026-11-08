@@ -1,0 +1,130 @@
+# -*- coding: utf-8 -*-
+import sys
+import time
+import threading
+import ctypes
+import usb.core
+from keyboard_utils import (
+    find_device, configure_device, read_report, find_consumer_endpoint,
+    read_consumer_report, parse_keyboard_report, parse_consumer_report,
+    simulate_modifiers, simulate_keys, simulate_key,
+    simulate_consumer_usage, update_key_repeats, release_all_keys,
+    get_device_product, get_current_layer_name
+)
+
+# ---------- 管理员权限检测 ----------
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+if not is_admin():
+    print("错误：此程序需要管理员权限才能访问 USB 设备。")
+    print("请右键点击命令提示符，选择“以管理员身份运行”，然后重新执行。")
+    sys.exit(1)
+
+# ---------- 消费类按键线程 ----------
+# 音量/多媒体/浏览器键由消费类接口（Usage Page 0x0C）上报，与键盘接口分开。
+# 用独立线程读取，避免阻塞键盘主循环；设备节点由描述符角色 + 探测读确定，
+# 不依赖枚举顺序和写死的接口号。
+def consumer_loop(dev, ep, stop_event):
+    warned = False
+    while not stop_event.is_set():
+        try:
+            raw = read_consumer_report(dev, ep)
+        except Exception as e:
+            # 接口暂时不可用（例如设备刚断开）时静默重试；整体重连仍由主循环负责
+            if not warned:
+                print(f"[警告] 消费类接口读取失败: {e}（将静默重试）")
+                warned = True
+            if stop_event.wait(1.0):
+                return
+            found = find_consumer_endpoint()
+            if found is not None:
+                dev, ep = found[0], found[1]
+            continue
+        usage = parse_consumer_report(raw)
+        if usage is not None:
+            simulate_consumer_usage(usage)
+
+# ---------- 主循环（处理按键） ----------
+def process_loop(dev, ep):
+    prev_modifier = 0
+    prev_keys = []
+    stop_event = threading.Event()
+    consumer_thread = None
+
+    # 媒体键接口：按角色遍历所有候选设备，自动选到真正持有该接口的节点
+    media = find_consumer_endpoint(verbose=True)
+    if media is not None:
+        media_dev, media_ep, media_ifno = media
+        print(f"[信息] 媒体键使用接口 {media_ifno}，端点 0x{media_ep.bEndpointAddress:02X}")
+        consumer_thread = threading.Thread(
+            target=consumer_loop, args=(media_dev, media_ep, stop_event), daemon=True)
+        consumer_thread.start()
+    else:
+        print("[提示] 未找到可读的消费类接口，媒体键/音量键不可用。")
+
+    print(f"开始监听键盘，当前层: {get_current_layer_name()}，按 Ctrl+C 退出。")
+    try:
+        while True:
+            raw = read_report(dev, ep)
+            modifier, keys = parse_keyboard_report(raw)
+            if keys is not None:
+                # 处理修饰键变化
+                if modifier != prev_modifier:
+                    simulate_modifiers(modifier, prev_modifier)
+                    prev_modifier = modifier
+                # 处理普通键变化（包含层切换逻辑）
+                if keys != prev_keys:
+                    simulate_keys(keys, prev_keys)
+                    # 注意：simulate_keys 会修改 prev_keys，因此这里不需要再赋值
+            # 注入的按键不会自动重复，按系统延迟/速率补发
+            update_key_repeats()
+            time.sleep(0.001)
+    except KeyboardInterrupt:
+        print("\n用户中断，清理...")
+        raise
+    finally:
+        # 断线/中断都要回到干净状态：停消费类线程、抬起所有键
+        stop_event.set()
+        if consumer_thread is not None:
+            consumer_thread.join(timeout=0.5)
+        release_all_keys()
+        simulate_consumer_usage(0)
+        print("已释放所有按键。")
+
+# ---------- 主程序（带自动重连） ----------
+def main():
+    print("启动正常模式...")
+    retry_interval = 5
+    while True:
+        try:
+            print("正在查找设备...")
+            dev = find_device()
+            product = get_device_product(dev)
+            print(f"找到设备: {product}")
+            
+            ep = configure_device(dev)
+            print(f"中断端点: 0x{ep.bEndpointAddress:02X}, 包大小: {ep.wMaxPacketSize}")
+            
+            process_loop(dev, ep)
+            break
+        
+        except KeyboardInterrupt:
+            print("\n程序已退出。")
+            break
+        
+        except usb.core.USBError as e:
+            print(f"USB 错误: {e}，{retry_interval}秒后重试...")
+            time.sleep(retry_interval)
+            continue
+        
+        except Exception as e:
+            print(f"发生未预期错误: {e}，{retry_interval}秒后重试...")
+            time.sleep(retry_interval)
+            continue
+
+if __name__ == "__main__":
+    main()
