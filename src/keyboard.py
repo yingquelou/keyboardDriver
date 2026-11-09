@@ -2,27 +2,26 @@
 import sys
 import time
 import threading
-import ctypes
+import app_paths
+
+# 打包形态下 libusb-1.0.dll 可能位于 sys._MEIPASS（onefile），
+# 必须在导入 pyusb 后端与 keyboard_utils 之前把该目录加入 DLL 搜索路径。
+app_paths.prepare_native_dlls()
+
 import usb.core
 from keyboard_utils import (
     find_device, configure_device, read_report, find_consumer_endpoint,
     read_consumer_report, parse_keyboard_report, parse_consumer_report,
     simulate_modifiers, simulate_keys, simulate_key,
     simulate_consumer_usage, update_key_repeats, release_all_keys,
+    has_active_keys, read_lock_bitmap, write_led_bitmap, LED_POLL_INTERVAL_S,
     get_device_product, get_current_layer_name
 )
 
-# ---------- 管理员权限检测 ----------
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-if not is_admin():
-    print("错误：此程序需要管理员权限才能访问 USB 设备。")
-    print("请右键点击命令提示符，选择“以管理员身份运行”，然后重新执行。")
-    sys.exit(1)
+# USB 读取超时（毫秒）：没有按键按下时用较长超时，让读操作阻塞等待、显著降低空转 CPU；
+# 有键按下（特别是自动重复进行中）时用短超时，减小重复补发的时间抖动。
+IDLE_READ_TIMEOUT_MS = 100
+ACTIVE_READ_TIMEOUT_MS = 2
 
 # ---------- 消费类按键线程 ----------
 # 音量/多媒体/浏览器键由消费类接口（Usage Page 0x0C）上报，与键盘接口分开。
@@ -48,15 +47,38 @@ def consumer_loop(dev, ep, stop_event):
         if usage is not None:
             simulate_consumer_usage(usage)
 
+# ---------- 指示灯线程 ----------
+# 位图完全由系统真实锁定状态计算，不维护影子状态：
+#   启动先同步一次，之后每 200ms 兜底轮询，锁定状态一变就立即写。
+# 写失败按 5 秒限流告警并在下一轮重试；任何异常都不会影响按键主循环。
+def led_loop(dev, stop_event):
+    last_bitmap = None
+    last_warn = 0.0
+    while not stop_event.is_set():
+        try:
+            bitmap = read_lock_bitmap()
+        except Exception:
+            bitmap = None
+        if bitmap is not None and bitmap != last_bitmap:
+            try:
+                write_led_bitmap(dev, bitmap)
+                last_bitmap = bitmap
+            except Exception as e:
+                now = time.monotonic()
+                if now - last_warn > 5:
+                    print(f"[警告] 指示灯写入失败: {e}（5 秒内不再重复告警）")
+                    last_warn = now
+        stop_event.wait(LED_POLL_INTERVAL_S)
+
 # ---------- 主循环（处理按键） ----------
-def process_loop(dev, ep):
+def process_loop(dev, ep, enable_led=False):
     prev_modifier = 0
     prev_keys = []
     stop_event = threading.Event()
     consumer_thread = None
 
-    # 媒体键接口：按角色遍历所有候选设备，自动选到真正持有该接口的节点
-    media = find_consumer_endpoint(verbose=True)
+    # 媒体键接口：复用已打开的键盘节点（同一进程重复打开同一复合设备会互相干扰）
+    media = find_consumer_endpoint(verbose=True, dev=dev)
     if media is not None:
         media_dev, media_ep, media_ifno = media
         print(f"[信息] 媒体键使用接口 {media_ifno}，端点 0x{media_ep.bEndpointAddress:02X}")
@@ -66,10 +88,21 @@ def process_loop(dev, ep):
     else:
         print("[提示] 未找到可读的消费类接口，媒体键/音量键不可用。")
 
+    # 指示灯同步线程：默认关闭。本设备在 WinUSB 接管模式下写灯返回成功但灯无反应，
+    # 只有显式 --led 才启用，避免无意义的小流量与日志噪音。
+    led_thread = None
+    if enable_led:
+        led_thread = threading.Thread(target=led_loop, args=(dev, stop_event), daemon=True)
+        led_thread.start()
+        print("[信息] 指示灯同步已启用（--led）")
+    else:
+        print("[信息] 指示灯同步未启用（本设备接管模式下写灯无效果，如需尝试请加 --led）")
+
     print(f"开始监听键盘，当前层: {get_current_layer_name()}，按 Ctrl+C 退出。")
     try:
         while True:
-            raw = read_report(dev, ep)
+            timeout = ACTIVE_READ_TIMEOUT_MS if has_active_keys() else IDLE_READ_TIMEOUT_MS
+            raw = read_report(dev, ep, timeout)
             modifier, keys = parse_keyboard_report(raw)
             if keys is not None:
                 # 处理修饰键变化
@@ -91,6 +124,8 @@ def process_loop(dev, ep):
         stop_event.set()
         if consumer_thread is not None:
             consumer_thread.join(timeout=0.5)
+        if led_thread is not None:
+            led_thread.join(timeout=0.5)
         release_all_keys()
         simulate_consumer_usage(0)
         print("已释放所有按键。")
@@ -98,6 +133,7 @@ def process_loop(dev, ep):
 # ---------- 主程序（带自动重连） ----------
 def main():
     print("启动正常模式...")
+    enable_led = '--led' in sys.argv[1:]   # 指示灯同步默认关闭，见 process_loop 内说明
     retry_interval = 5
     while True:
         try:
@@ -109,7 +145,7 @@ def main():
             ep = configure_device(dev)
             print(f"中断端点: 0x{ep.bEndpointAddress:02X}, 包大小: {ep.wMaxPacketSize}")
             
-            process_loop(dev, ep)
+            process_loop(dev, ep, enable_led)
             break
         
         except KeyboardInterrupt:

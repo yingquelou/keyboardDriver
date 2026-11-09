@@ -1,22 +1,16 @@
 # -*- coding: utf-8 -*-
+import os
 import sys
 import time
-import ctypes
+
+# 本文件位于 tools/：把 src/ 加入模块搜索路径，避免依赖当前工作目录。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
 import usb.core
 from keyboard_utils import (
     find_device, configure_device, read_report, parse_keyboard_report,
     get_vk_name, get_vk, get_current_layer_name
 )
-
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-if not is_admin():
-    print("错误：此程序需要管理员权限。")
-    sys.exit(1)
 
 def calibrate_mode(dev, ep):
     prev_modifier = 0

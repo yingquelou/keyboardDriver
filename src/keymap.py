@@ -2,7 +2,10 @@
 # keymap.py - 两层映射表，通过集合运算构建
 # 由用户维护 C、XL、XN 三个子集，程序自动生成完整的两层映射
 
-import win32con
+try:
+    import win32con
+except ImportError:                       # 未安装 pywin32（例如 MSYS2/mingw 版 Python）
+    import win32_compat as win32con
 
 # ---------- 补全 win32con 缺失的 OEM 常量 ----------
 undefined_vk = {
@@ -88,7 +91,9 @@ C = {
     0x46: win32con.VK_SNAPSHOT, 
 
     # 编辑键（两层共用，若需要不同可放在 XL/XN）
-    0x4C: win32con.VK_DELETE,   0x53: win32con.VK_NUMLOCK,
+    0x47: win32con.VK_SCROLL,   0x4C: win32con.VK_DELETE,
+    # 0x53（数字锁定键位）是层切换键，由 keyboard_utils.LAYER_TOGGLE_HID 截获，
+    # 不注入系统、不切换 Num Lock 状态，因此这里不能映射，否则会与层切换冲突。
 
     # 切换键（两层都忽略）
     0x58: win32con.VK_RETURN,

@@ -4,8 +4,12 @@ import time
 import usb.core
 import usb.util
 import usb.backend.libusb1
-import win32api
-import win32con
+try:
+    import win32api
+    import win32con
+except ImportError:                       # 未安装 pywin32 时退回 ctypes 兼容层
+    import win32_compat as win32api
+    win32con = win32api
 from keymap import LAYERS, DEFAULT_LAYER_NAME, get_consumer_vk
 
 # ---------- 硬件配置 ----------
@@ -28,12 +32,29 @@ BOOT_REPORT_LENGTH = 8
 CONSUMER_REPORT_ID = 1
 CONSUMER_USAGE_SIZE = 2
 
+# ---------- 指示灯 ----------
+# 键盘接口（MI_00）的 HID 输出报告：5 位 LED（Num/Caps/Scroll/Compose/Kana）+ 3 位填充 = 1 字节。
+# 实测结论（本键盘 1EA7:0066，WinUSB 接管模式）：
+#   Set_Report（1 字节 / 2 字节）与各类位图写入均返回成功，但物理指示灯无任何反应，
+#   接口 0 也只有 IN 端点（无中断 OUT 端点）。因此判定该键盘的指示灯在接管模式下不可控，
+#   原生 HID 驱动下灯是正常的。相关实现默认不启用（keyboard.py 需显式 --led），
+#   保留代码仅用于其它设备/未来验证。
+LED_BIT_NUM_LOCK = 0x01
+LED_BIT_CAPS_LOCK = 0x02
+LED_BIT_SCROLL_LOCK = 0x04
+LED_POLL_INTERVAL_S = 0.2      # 低频兜底轮询，避免无谓的 USB 流量
+
 # ---------- 后端初始化 ----------
 backend = usb.backend.libusb1.get_backend()
 if backend is None:
     raise RuntimeError("无法加载 libusb 后端")
 
 # ---------- 层管理 ----------
+# 层切换键：实测 MI_00 原始报告上报 HID usage 0x53（数字锁定键位），与原始驱动一致。
+# 该键只负责切换映射层，不注入系统（不触发 Num Lock 锁定状态），也不参与自动重复。
+# 全项目只在这里定义一次，避免映射表与逻辑两处写死。
+LAYER_TOGGLE_HID = 0x53
+
 _current_layer_name = DEFAULT_LAYER_NAME          # 当前层名称
 _current_layer_dict = LAYERS[_current_layer_name] # 当前层映射字典
 
@@ -93,9 +114,9 @@ def _candidate_devices():
 def _configurations(dev):
     """取设备全部配置描述符；拿不到时退回当前生效配置"""
     try:
-        cfgs = list(dev.configurations)
+        cfgs = _resolve(getattr(dev, 'configurations', None))
         if cfgs:
-            return cfgs
+            return list(cfgs)
     except Exception:
         pass
     try:
@@ -103,18 +124,27 @@ def _configurations(dev):
     except Exception:
         return []
 
+def _resolve(value):
+    """pyusb 1.3 起 configurations/endpoints 等变成了方法，这里统一取值"""
+    if callable(value):
+        try:
+            return value()
+        except Exception:
+            return None
+    return value
+
 def _iter_settings(item):
-    """列出配置下某个接口的所有备用设置（兼容 pyusb 的两种迭代形态）"""
+    """列出配置下某个接口的所有备用设置（兼容属性/方法两种形态）"""
     if hasattr(item, 'bEndpointAddress'):
         return []
-    settings = getattr(item, 'alternate_settings', None)
+    settings = _resolve(getattr(item, 'alternate_settings', None))
     if settings:
         return list(settings)
     return [item]
 
 def _iter_endpoints(setting):
-    """列出某个备用设置下的端点（兼容 pyusb 的两种迭代形态）"""
-    eps = getattr(setting, 'endpoints', None)
+    """列出某个备用设置下的端点（兼容属性/方法两种形态）"""
+    eps = _resolve(getattr(setting, 'endpoints', None))
     if eps:
         return list(eps)
     result = []
@@ -123,7 +153,7 @@ def _iter_endpoints(setting):
             if hasattr(sub, 'bEndpointAddress'):
                 result.append(sub)
             else:
-                result.extend(getattr(sub, 'endpoints', []) or [])
+                result.extend(list(_resolve(getattr(sub, 'endpoints', None)) or []))
     except Exception:
         pass
     return result
@@ -182,12 +212,16 @@ def _get_report_descriptor(dev, intf_no, timeout=200):
         return None
 
 def _parse_hid_descriptor(desc):
-    """从报告描述符中找消费类集合的输入报告：返回 (Report ID, usage 字节数)，未找到返回 (None, None)"""
+    """从报告描述符中找消费类集合的输入报告：返回 (Report ID, usage 字节数)，未找到返回 (None, None)
+
+    注意：同一个描述符里可能有其它集合借用 Usage Page 0x0C（例如鼠标的 AC Pan，
+    8 位），而消费类 usage 本身是 16 位的；实测本键盘的鼠标集合就夹在中间，
+    因此优先取 Report Size >= 16 位的输入项，避免误认成 Report ID 2。"""
     usage_page = 0
     report_id = 0
     report_size = 0
-    found_id = None
-    found_size = None
+    fallback_id = None
+    fallback_size = None
     i = 0
     n = len(desc)
     while i < n:
@@ -217,11 +251,14 @@ def _parse_hid_descriptor(desc):
                 report_size = value
             elif tag == 0x8:        # Report ID
                 report_id = value
-        elif itype == 0 and tag == 0x8 and usage_page == 0x0C and found_id is None:
+        elif itype == 0 and tag == 0x8 and usage_page == 0x0C:
             # 主项 Input，且当前用途页为消费类
-            found_id = report_id
-            found_size = max(1, min(2, report_size // 8))
-    return found_id, found_size
+            if report_size >= 16:
+                return report_id, 2
+            if fallback_id is None:
+                fallback_id = report_id
+                fallback_size = max(1, min(2, report_size // 8))
+    return fallback_id, fallback_size
 
 def _is_timeout_error(e):
     """区分“读超时（端点可用、当前无数据）”和“端点/节点不可用”"""
@@ -305,36 +342,39 @@ def configure_device(dev):
         raise ValueError("未找到中断输入端点")
     return ep_in
 
-def find_consumer_endpoint(verbose=False):
+def find_consumer_endpoint(verbose=False, dev=None):
     """在所有候选中定位可用的消费类接口，返回 (设备, 端点, 接口号) 或 None
 
     Win7/Win11 的枚举顺序、接口编号都可能不同，因此：
     - 接口由报告描述符（Usage Page 0x0C）识别，不用写死的接口号；
-    - 设备节点用 1ms 探测读确认，自动跳过不属于该接口的 PDO。"""
-    devs = _candidate_devices()
+    - 设备节点用 1ms 探测读确认，自动跳过不属于该接口的 PDO。
+    - 传入 dev 时直接复用已打开的节点：同一进程重复打开同一复合设备会互相干扰
+      （第二次 libusb 打开后读报告描述符会失败）。"""
+    devs = [dev] if dev is not None else _candidate_devices()
     if verbose:
         _describe_candidates(devs)
     found = None
-    for dev in devs:
-        # 未激活配置时部分后端读不到描述符，先尽力激活
-        _try_set_configuration(dev)
-        media = _find_media_interface(dev)
+    for candidate in devs:
+        # 未激活配置时部分后端读不到描述符，先尽力激活；已打开的节点不必再激活
+        if dev is None:
+            _try_set_configuration(candidate)
+        media = _find_media_interface(candidate)
         if media is None:
             continue
         setting, ep, report_id, usage_size = media
         if verbose:
             print(f"[信息] 消费类接口 {setting.bInterfaceNumber} 端点 0x{ep.bEndpointAddress:02X}"
                   f" 报告描述符 Report ID={report_id} usage {usage_size} 字节")
-        if not _probe_endpoint(dev, ep):
+        if not _probe_endpoint(candidate, ep):
             if verbose:
                 print(f"[警告] 设备候选（接口 {setting.bInterfaceNumber}）探测读失败，跳过")
             continue
         try:
-            usb.util.claim_interface(dev, setting.bInterfaceNumber)
+            usb.util.claim_interface(candidate, setting.bInterfaceNumber)
         except usb.core.USBError:
             # 驱动已占用时 claim 会失败，仍可继续尝试读取
             pass
-        found = (dev, ep, setting.bInterfaceNumber)
+        found = (candidate, ep, setting.bInterfaceNumber)
         break
     if found is None and verbose:
         print("[警告] 未找到可读的消费类接口（报告描述符中没有 Usage Page 0x0C 的输入报告）")
@@ -456,7 +496,7 @@ def _get_repeat_timing():
             delay_ms = 250 * (level.value + 1)
         speed = ctypes.c_uint(0)
         if user32.SystemParametersInfoW(0x000A, 0, ctypes.byref(speed), 0):  # SPI_GETKEYBOARDSPEED
-            rate = 2.5 + speed.value * (27.5 / 31.0)   # 2.5 ~ 30 次/秒
+            rate = 2.5 + speed.value * 0.5     # 2.5 ~ 18 次/秒（Windows 的实际换算）
             interval_ms = max(1, int(1000.0 / rate))
     except Exception:
         pass
@@ -465,37 +505,58 @@ def _get_repeat_timing():
     return _repeat_timing
 
 def update_key_repeats(now=None):
-    """按住最近按下的键超过系统重复延迟后，按系统速率补发 keydown"""
+    """按住键超过系统重复延迟后，按系统速率补发 keydown
+
+    三路独立：普通键键槽、修饰键、消费类音量键。它们的重复目标互不相同，
+    因此不使用互斥返回，避免音量键按住时被普通键的重复逻辑挡住。
+    """
     if now is None:
         now = time.monotonic()
+    global _consumer_repeat_next
     delay_ms, interval_ms = _get_repeat_timing()
+
+    def _advance(next_time, start_time):
+        """以“计划时刻”为基准推进，避免每次把唤醒延迟累加进间隔；落后太多时重置"""
+        due = next_time
+        if due is None:
+            due = start_time + delay_ms / 1000.0
+        if now < due:
+            return due, False
+        nxt = due + interval_ms / 1000.0
+        if nxt < now:
+            nxt = now + interval_ms / 1000.0
+        return nxt, True
+
     if _repeat_hid is not None:
         vk = _active_keys.get(_repeat_hid)
         start = _key_down_time.get(_repeat_hid)
-        if vk is None or start is None:
-            return
-        due = _repeat_next.get(_repeat_hid)
-        if due is None:
-            due = start + delay_ms / 1000.0
-        if now >= due:
-            simulate_key(vk, down=True)
-            # 从本次实际补发时刻起算下一轮，避免同一时刻被重复判定为到期
-            _repeat_next[_repeat_hid] = now + interval_ms / 1000.0
-        return
+        if vk is not None and start is not None:
+            nxt, fire = _advance(_repeat_next.get(_repeat_hid), start)
+            _repeat_next[_repeat_hid] = nxt
+            if fire:
+                simulate_key(vk, down=True)
+
     if _repeat_mod is not None:
         start = _modifier_down.get(_repeat_mod)
-        if start is None:
-            return
-        due = _repeat_mod_next.get(_repeat_mod)
-        if due is None:
-            due = start + delay_ms / 1000.0
-        if now >= due:
-            simulate_key(_repeat_mod, down=True)
-            _repeat_mod_next[_repeat_mod] = now + interval_ms / 1000.0
+        if start is not None:
+            nxt, fire = _advance(_repeat_mod_next.get(_repeat_mod), start)
+            _repeat_mod_next[_repeat_mod] = nxt
+            if fire:
+                simulate_key(_repeat_mod, down=True)
+
+    if _consumer_repeat_vk is not None and _consumer_vk == _consumer_repeat_vk:
+        nxt, fire = _advance(_consumer_repeat_next, _consumer_repeat_start)
+        _consumer_repeat_next = nxt
+        if fire:
+            simulate_key(_consumer_repeat_vk, down=True)
+
+def has_active_keys():
+    """是否仍有按键处于按下状态（普通键、修饰键或音量键重复中）；用于选择 USB 读取超时"""
+    return bool(_active_keys) or bool(_modifier_down) or _consumer_repeat_vk is not None
 
 def release_all_keys():
     """释放所有当前按下的键（使用按下时记录的虚拟键码）"""
-    global _repeat_hid, _repeat_mod
+    global _repeat_hid, _repeat_mod, _consumer_repeat_vk, _consumer_repeat_next
     for vk in list(_active_keys.values()):
         simulate_key(vk, down=False)
     for vk in list(_modifier_down.keys()):
@@ -507,22 +568,26 @@ def release_all_keys():
     _repeat_mod_next.clear()
     _repeat_hid = None
     _repeat_mod = None
+    # 断线/退出时同步停掉音量键重复，避免定时器继续补发
+    _consumer_repeat_vk = None
+    _consumer_repeat_next = None
 
 def simulate_keys(current_keys, prev_keys):
     """
     处理按键变化。
-    特殊截获 Scroll Lock (0x47) 作为层切换触发器，不输出任何按键。
+    特殊截获层切换键（LAYER_TOGGLE_HID，实测为数字锁定键位 0x53）作为层切换触发器，
+    不输出任何按键。
     """
     global _repeat_hid, _repeat_mod
-    # ---- 检测 Scroll Lock 按下 (0x47)：只在“上一份报告未按下、本报告按下”时切换一次 ----
-    # 不能用排除 0x47 的 prev_keys 做比较，否则按住层切换键期间每出现一个新键都会再次切换。
-    if 0x47 in current_keys and 0x47 not in prev_keys:
+    # ---- 检测层切换键按下：只在“上一份报告未按下、本报告按下”时切换一次 ----
+    # 不能用排除该键的 prev_keys 做比较，否则按住层切换键期间每出现一个新键都会再次切换。
+    if LAYER_TOGGLE_HID in current_keys and LAYER_TOGGLE_HID not in prev_keys:
         # 执行层切换
         toggle_layer()
-        # 注意：不模拟任何按键，Scroll Lock 本身不会产生字符
+        # 注意：不模拟任何按键，层切换键本身不产生任何输入
 
-    # ---- 处理其他所有按键（排除 Scroll Lock） ----
-    other_current = [k for k in current_keys if k != 0x47]
+    # ---- 处理其他所有按键（排除层切换键） ----
+    other_current = [k for k in current_keys if k != LAYER_TOGGLE_HID]
 
     now = time.monotonic()
 
@@ -553,31 +618,58 @@ def simulate_keys(current_keys, prev_keys):
         if vk not in _NO_REPEAT_VKS:
             _repeat_hid = hid_code
 
-    # 更新 prev_keys：保留 0x47 的真实状态，供下一份报告的边沿检测使用
+    # 更新 prev_keys：保留层切换键的真实状态，供下一份报告的边沿检测使用
     prev_keys[:] = list(current_keys)
 
 # ---------- 消费类按键 ----------
+# 该端点只在按下、抬起各上报一次，按住不会重发，因此音量键的长按由主机侧定时补发
+_CONSUMER_REPEAT_VKS = (win32con.VK_VOLUME_UP, win32con.VK_VOLUME_DOWN)
 _consumer_usage = 0
 _consumer_vk = None
+_consumer_repeat_vk = None     # 当前参与重复的音量类 VK（其它媒体键为 None）
+_consumer_repeat_start = 0.0
+_consumer_repeat_next = None
 
 def simulate_consumer_usage(usage):
-    """把消费类 usage 注入为对应虚拟键；usage 变为 0 时抬起"""
+    """把消费类 usage 注入为对应虚拟键；usage 变为 0 时抬起并停止重复"""
     global _consumer_usage, _consumer_vk
+    global _consumer_repeat_vk, _consumer_repeat_start, _consumer_repeat_next
     if usage == _consumer_usage:
-        # 设备按住媒体键时会重发同样的报告，原生驱动按“每次报告=一次动作”处理，
-        # 因此重复的同一 usage 再补发一次 keydown（如长按音量键会持续加减音量）。
-        if usage and _consumer_vk is not None:
-            simulate_key(_consumer_vk, down=True)
+        # 设备不重发报告，重复由 update_key_repeats 按系统节奏补发；
+        # 这里直接忽略重复报告，避免与定时补发叠加成双倍速率
         return
     if _consumer_vk is not None:
         simulate_key(_consumer_vk, down=False)
         _consumer_vk = None
+    _consumer_repeat_vk = None
+    _consumer_repeat_next = None
     _consumer_usage = usage
     if usage:
         vk = get_consumer_vk(usage)
         if vk is not None:
             simulate_key(vk, down=True)
             _consumer_vk = vk
+            # 只有音量键参与长按重复；静音/播放暂停/上下曲始终单次
+            if vk in _CONSUMER_REPEAT_VKS:
+                _consumer_repeat_vk = vk
+                _consumer_repeat_start = time.monotonic()
+
+# ---------- 指示灯同步 ----------
+def read_lock_bitmap():
+    """按系统真实锁定状态计算 LED 位图：Num/Caps/Scroll 对应 VK_NUMLOCK/VK_CAPITAL/VK_SCROLL"""
+    user32 = ctypes.windll.user32
+    bitmap = 0
+    if user32.GetKeyState(0x90) & 1:        # VK_NUMLOCK
+        bitmap |= LED_BIT_NUM_LOCK
+    if user32.GetKeyState(0x14) & 1:        # VK_CAPITAL
+        bitmap |= LED_BIT_CAPS_LOCK
+    if user32.GetKeyState(0x91) & 1:        # VK_SCROLL
+        bitmap |= LED_BIT_SCROLL_LOCK
+    return bitmap
+
+def write_led_bitmap(dev, bitmap, timeout=100):
+    """把 LED 位图写入键盘接口的输出报告（HID Set_Report）"""
+    dev.ctrl_transfer(0x21, 0x09, 0x0200, 0, bytes([bitmap]), timeout=timeout)
 
 # ---------- 导出 ----------
 __all__ = [
@@ -585,6 +677,7 @@ __all__ = [
     'read_consumer_report', 'parse_keyboard_report', 'parse_consumer_report',
     'simulate_key', 'simulate_modifiers', 'simulate_keys', 'simulate_consumer_usage',
     'update_key_repeats', 'release_all_keys',
+    'read_lock_bitmap', 'write_led_bitmap',
     'get_vk_name', 'get_device_product', 'get_current_layer_name',
     'toggle_layer', 'get_vk'
 ]

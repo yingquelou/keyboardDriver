@@ -1,0 +1,11 @@
+# 构建/运行产物
+__pycache__/
+*.pyc
+
+# 本地虚拟环境与第三方安装包（体积大、不适合入库）
+.venv/
+zadig-*.exe
+
+# PyInstaller 打包产物与中间文件（手工执行 PyInstaller 时生成）
+dist/
+build/
