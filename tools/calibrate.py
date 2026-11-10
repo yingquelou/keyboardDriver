@@ -18,7 +18,7 @@ def calibrate_mode(dev, ep):
     print("\n=== 键盘校准模式（信息查看） ===")
     print(f"当前层: {get_current_layer_name()}")
     print("按下按键，程序会显示其 HID 键码和当前映射的虚拟键码名称。")
-    print("如需修改映射，请手动编辑 keymap.py 文件。")
+    print("如需修改映射，请手动编辑 src\\device_profile\\keys.py 中的 C/XL/XN 表。")
     print("按 Ctrl+C 退出校准模式。\n")
 
     try:

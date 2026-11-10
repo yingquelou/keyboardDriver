@@ -3,7 +3,7 @@
 
 本项目只用到 win32con 的 VK_ 常量与 win32api.keybd_event。
 本机 Python 为 MSYS2/mingw 版时无法安装 pywin32（没有匹配的二进制轮子），
-keymap.py 与 keyboard_utils.py 在导入失败时退回本模块，使用方式保持不变。
+device_profile 包的 _win32.py 与 keyboard_utils.py 在导入失败时退回本模块，使用方式保持不变。
 """
 
 import ctypes

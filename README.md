@@ -93,13 +93,13 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 
 ## 键位映射与层切换
 
-- 映射表在 `keymap.py`：`letter`（字母层）与 `number`（数字层）。
+- 映射表在 `src\device_profile\keys.py`：用户维护 `C` / `XL` / `XN` 三个子集，合并成 `letter`（字母层）与 `number`（数字层）。
 - **层切换键 = HID `0x53`（数字锁定键位）**，与原始驱动一致：
   - 只在“上一份报告未按下 → 本次按下”时切换一次；
   - 本身不注入任何按键，**不改变系统 Num Lock 状态**，也不参与自动重复；
   - 按住期间跨层，松开时按按下时记录的 VK 抬起。
 - **Scroll Lock = HID `0x47`**：普通键，注入 `VK_SCROLL` 并切换系统锁定状态；锁定键不参与自动重复。
-- 常量统一在 `keyboard_utils.LAYER_TOGGLE_HID`，不要在别处写死。
+- 设备专有常量统一在 `src\device_profile\` 包（`LAYER_TOGGLE_HID` 等），不要在别处写死。
 
 ### 长按自动重复
 
@@ -109,6 +109,143 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 - 首重复延迟：实测 505–514 ms（系统 500 ms，+1~3%）
 - 重复间隔：实测平均 54.9 ms（系统 55.6 ms，−1.2%）；单次间隔有 40–70 ms 抖动
 - 锁定键（Caps/Num/Scroll）不产生重复；修饰键按住同样按此节奏补发
+
+## 接入另一把键盘
+
+设备专有内容**全部集中在 `src\device_profile\` 这个包里**：VID/PID、接口角色、键盘报告布局、
+消费类报告、HID→VK 映射与层、层切换键、自动重复策略、指示灯能力。
+`keyboard.py`、`keyboard_utils.py`、`run_keyboard.py` 只调用这个包，不含任何本键盘的
+常量或分支——换键盘时**只改这个包**（保持包名与导出名不变，它是唯一的设备插槽）。
+
+包内按职责拆分，导出名保持不变：
+
+| 文件 | 内容 | 典型改动 |
+|---|---|---|
+| `identity.py` | VID/PID、接口判定、端点预期 | 换设备身份或接口类/子类/协议 |
+| `reports.py` | 键盘报告布局与解析、消费类 Report ID/usage、读取长度 | 报告格式不同 |
+| `keys.py` | `C` / `XL` / `XN` / `CONSUMER` 映射表、层与层切换键 | **键位映射（最常见）** |
+| `policy.py` | 自动重复规则、指示灯能力 | 行为策略不同 |
+
+（`__init__.py` 只做导出，`_win32.py` 是私有兼容层；详见 `src\device_profile\README.md`。）
+
+步骤：
+
+1. 备份现有 `src\device_profile\` 目录（换回时可原样恢复）；
+2. 按下面的必需项清单改写导出名，多数情况只改 `keys.py` 的映射表（`tools\calibrate.py` 会打印每个键的 HID 码）；
+3. 用 `tools\probe_keyboard.py`、`tools\enum_usb_nodes.py` 核对接口角色、报告长度与 Report ID；
+4. 直接运行 `src\keyboard.py` 验证，不需要改动其它源码。
+
+### 必需项（导出名与用途）
+
+函数的返回值就是通用代码唯一的取值入口；布局常量（报告长度、槽区间等）主要供设备包内部
+使用，改新键盘时用来描述实测格式。
+
+| 名称 | 类型 | 说明 |
+|---|---|---|
+| `NAME` / `VID` / `PID` | str / int / int | 显示名与枚举过滤条件 |
+| `is_keyboard_interface(setting)` | bool | 键盘接口识别（本键盘为 HID 类 3/子类 1/协议 1） |
+| `is_consumer_interface(setting)` | bool | 消费类接口候选（本键盘为 HID 且非 boot 键盘） |
+| `ENDPOINT_DIRECTION` / `ENDPOINT_TYPE` | str | `'in'`/`'out'`、`'interrupt'`/`'bulk'`/`'isochronous'` |
+| `KEY_REPORT_LENGTH` / `MODIFIER_BYTE_INDEX` | int | 报告长度与修饰键位图位置（`parse_key_report` 内部使用） |
+| `KEY_SLOT_START` / `KEY_SLOT_END` | int | 键码槽区间（左闭右开） |
+| `parse_key_report(raw)` | `(int, list[int] or None)` | 返回 (修饰键字节, 键码列表)；长度不足返回 `(0, None)` |
+| `key_report_read_size(max_packet_size)` | int | 单次读取长度，至少覆盖完整报告 |
+| `CONSUMER_USAGE_PAGE` | int | 消费类集合的 Usage Page（HID 规范值 `0x0C`） |
+| `choose_consumer_report(items)` | `(report_id, usage_bytes)` 或 `None` | 从描述符 Input 项 `(usage_page, report_id, report_size_bits)` 中选出消费类报告 |
+| `consumer_report_read_size(max_packet_size)` | int | 消费类单次读取长度 |
+| `parse_consumer_report(raw)` | int 或 None | 按 Report ID 过滤混流报文后返回 usage |
+| `LAYERS` / `DEFAULT_LAYER_NAME` | dict / str | 层名 → `{HID: VK}`；启动层名 |
+| `get_vk(layer_name, hid_code)` | int 或 None | 按层取虚拟键码 |
+| `get_consumer_vk(usage)` | int 或 None | 消费类 usage → 虚拟键码 |
+| `is_layer_toggle(hid_code)` | bool | 是否为层切换键（不注入、不重复） |
+| `next_layer_name(current_name)` | str | 下一层；只有一层时返回原名（等于不切换） |
+| `repeats_key(vk)` | bool | 普通键/修饰键是否参与自动重复 |
+| `repeats_consumer(vk)` | bool | 消费类键是否参与长按重复 |
+| `LED_SUPPORTED` / `LED_UNAVAILABLE_HINT` | bool / str | 是否声明指示灯可用；关闭时打印的说明 |
+| `LED_REPORT_LENGTH` / `LED_BITS` / `LED_POLL_INTERVAL_S` | int / tuple / float | 输出报告长度、`(bit, vk)` 位序、轮询间隔 |
+| `led_report(bitmap)` | bytes | 把 LED 位图打包成 HID 输出报告 |
+
+### 可选能力
+
+- **没有消费类接口**：`is_consumer_interface` 返回 `False` 即可；程序打印“未找到可读的
+  消费类接口”后继续只跑键盘，不影响主流程。
+- **没有层切换**：`LAYERS` 只放一层、`is_layer_toggle` 恒返回 `False`、`next_layer_name` 返回原名。
+- **没有指示灯**：`LED_SUPPORTED = False`、`LED_BITS = ()`；`LED_REPORT_LENGTH` 与
+  `led_report` 仍需存在（默认不启用，只有 `--led` 才会走到）。
+- **报告带 Report ID 或长度不同**：只改 `KEY_REPORT_LENGTH` / `MODIFIER_BYTE_INDEX` /
+  槽区间与 `parse_key_report` 的取值偏移。
+- **消费类 usage 不是 16 位小端**：改 `parse_consumer_report` 的切片与字节序。
+
+### 最小骨架
+
+按文件填下面内容（省略号处补实现）即可跑通主流程，`__init__.py` 的导出清单不用改：
+
+`identity.py`
+
+```python
+NAME, VID, PID = "示例键盘", 0x1234, 0x5678
+ENDPOINT_DIRECTION, ENDPOINT_TYPE = 'in', 'interrupt'
+
+def is_keyboard_interface(setting): ...
+def is_consumer_interface(setting): ...
+```
+
+`reports.py`
+
+```python
+CONSUMER_USAGE_PAGE = 0x0C
+KEY_REPORT_LENGTH, MODIFIER_BYTE_INDEX = 8, 0
+KEY_SLOT_START, KEY_SLOT_END = 2, 8
+
+def parse_key_report(raw):
+    if raw is None or len(raw) < KEY_REPORT_LENGTH:
+        return 0, None
+    data = bytes(raw)
+    return data[0], [b for b in data[KEY_SLOT_START:KEY_SLOT_END] if b]
+
+def key_report_read_size(max_packet_size):
+    return max(KEY_REPORT_LENGTH, max_packet_size)
+
+def choose_consumer_report(items): ...
+def consumer_report_read_size(max_packet_size): ...
+def parse_consumer_report(raw): ...
+```
+
+`keys.py`
+
+```python
+LAYERS = {'default': {0x04: ord('A')}}
+DEFAULT_LAYER_NAME = 'default'
+CONSUMER = {}
+
+def get_vk(layer_name, hid_code):
+    return LAYERS.get(layer_name, {}).get(hid_code)
+
+def get_consumer_vk(usage):
+    return CONSUMER.get(usage)
+
+def is_layer_toggle(hid_code):
+    return False
+
+def next_layer_name(current_name):
+    return current_name
+```
+
+`policy.py`
+
+```python
+def repeats_key(vk):
+    return vk is not None
+
+def repeats_consumer(vk):
+    return False
+
+LED_SUPPORTED, LED_UNAVAILABLE_HINT = False, "示例键盘未声明指示灯能力"
+LED_REPORT_LENGTH, LED_BITS, LED_POLL_INTERVAL_S = 1, (), 0.2
+
+def led_report(bitmap):
+    return bytes([bitmap & 0xFF])
+```
 
 ## 媒体键
 

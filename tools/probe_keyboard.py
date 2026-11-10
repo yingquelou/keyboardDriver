@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""probe_keyboard.py —— USB 无线键盘（1EA7:0066）真机诊断脚本
+"""probe_keyboard.py —— USB 无线键盘真机诊断脚本（设备身份取自 device_profile 包）
 
-独立脚本：只依赖 Python 标准库 + ctypes（setupapi / hid.dll / user32 / kernel32），
-不使用 pyusb，不需要 Zadig，不替换系统驱动，也不会独占键盘。
+独立脚本：只依赖 Python 标准库、ctypes（setupapi / hid.dll / user32 / kernel32）
+与本仓库的 src\\device_profile\\identity.py（仅取 VID/PID），不使用 pyusb，不需要 Zadig，
+不替换系统驱动，也不会独占键盘。
 
 用法（建议在目标机上以管理员身份打开命令提示符）：
     python probe_keyboard.py            # 默认：只处理 VID/PID 匹配的集合 + 抓包
@@ -13,6 +14,7 @@
 """
 
 import ctypes
+import os
 import struct
 import sys
 import time
@@ -22,8 +24,9 @@ import threading
 import traceback
 from ctypes import wintypes
 
-VID = 0x1EA7
-PID = 0x0066
+# 本文件位于 tools/：从 src/device_profile 包读取设备身份，避免在诊断脚本里重复硬编码
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from device_profile import VID, PID, NAME as DEVICE_NAME
 
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ_WRITE = 0x00000003
@@ -664,7 +667,7 @@ def pump_messages():
 # ---------------- 主流程 ----------------
 def print_header():
     print('=' * 62)
-    print('USB 无线键盘诊断  VID:PID = %04X:%04X' % (VID, PID))
+    print('USB 无线键盘诊断  %s（VID:PID = %04X:%04X）' % (DEVICE_NAME, VID, PID))
     print('系统: %s' % platform.platform())
     print('Python: %s（%d 位，ctypes 指针 %d 字节）' % (
         platform.python_version(), struct.calcsize('P') * 8, struct.calcsize('P')))

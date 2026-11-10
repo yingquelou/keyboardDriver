@@ -10,15 +10,15 @@
 全部是只读查询，不安装、不修改、不重绑任何驱动。Python 3.x（32/64 位）均可运行。
 
 用法：
-    python enum_usb_nodes.py                  # 默认 VID=1EA7 PID=0066
-    python enum_usb_nodes.py --vid 1EA7 --pid 0066
+    python enum_usb_nodes.py                  # VID/PID 默认取自 src\\device_profile\\identity.py
+    python enum_usb_nodes.py --vid <HEX> --pid <HEX>
     python enum_usb_nodes.py --all-nodes      # 打印枚举到的全部 USB 节点（可能很长）
     python enum_usb_nodes.py --sample 5       # 自检时列出的示例节点个数（默认 3）
 
 判读要点：
   * 本脚本看到的是 Windows 的「设备节点（devnode）」：复合设备由 usbccgp.sys
-    为每个接口各建一个子节点，实例 ID 形如 USB\\VID_1EA7&PID_0066&MI_01\\...
-    父节点实例 ID 形如 USB\\VID_1EA7&PID_0066\\...
+    为每个接口各建一个子节点，实例 ID 形如 USB\\VID_xxxx&PID_xxxx&MI_01\\...
+    父节点实例 ID 形如 USB\\VID_xxxx&PID_xxxx\\...
   * Zadig（libwdi）用同一个 USB 枚举器列条目，但过滤规则不同：未勾
     "List All Devices" 时跳过带驱动键（SPDRP_DRIVER）的节点；勾上后不再按驱动
     过滤，但仍会跳过 USB hub 与 service=usbccgp 的复合父节点（除非再开 Include Hubs）。
@@ -30,10 +30,19 @@
 import argparse
 import ctypes
 import datetime
+import os
 import platform
 import re
 import sys
 from ctypes import wintypes
+
+
+def profile_defaults():
+    """从 src\\device_profile\\identity.py 读取默认 VID/PID（避免在通用工具里重复硬编码）"""
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+    sys.path.insert(0, src_dir)
+    from device_profile import VID, PID
+    return '%04X' % VID, '%04X' % PID
 
 DIGCF_PRESENT = 0x02
 DIGCF_ALLCLASSES = 0x04
@@ -284,19 +293,31 @@ def classify(rec, present):
 def main():
     parser = argparse.ArgumentParser(
         description='只读枚举 VID/PID 对应的 USB 设备节点（父设备 + 复合设备接口）')
-    parser.add_argument('--vid', default='1EA7', help='VID，十六进制（默认 1EA7）')
-    parser.add_argument('--pid', default='0066', help='PID，十六进制（默认 0066）')
+    parser.add_argument('--vid', default=None,
+                        help='VID，十六进制（默认取 device_profile 包）')
+    parser.add_argument('--pid', default=None,
+                        help='PID，十六进制（默认取 device_profile 包）')
     parser.add_argument('--all-nodes', action='store_true',
                         help='打印枚举到的全部 USB 节点实例 ID')
     parser.add_argument('--sample', type=int, default=3,
                         help='自检时列出的示例节点个数（默认 3）')
     args = parser.parse_args()
 
+    if not args.vid or not args.pid:
+        try:
+            default_vid, default_pid = profile_defaults()
+        except Exception as exc:
+            print('无法从 src\\device_profile\\identity.py 读取默认 VID/PID（%s）；'
+                  '请用 --vid/--pid 指定' % exc)
+            return 2
+        args.vid = args.vid or default_vid
+        args.pid = args.pid or default_pid
+
     try:
         vid = int(args.vid, 16)
         pid = int(args.pid, 16)
     except ValueError:
-        print('VID/PID 必须是十六进制，例如 --vid 1EA7 --pid 0066')
+        print('VID/PID 必须是十六进制，例如 --vid 046D --pid C52B')
         return 2
 
     print('# enum_usb_nodes 只读诊断')

@@ -11,7 +11,7 @@
 ```
 keyboard-driver-win7\
 ├─ README.md
-├─ src\                       # 运行期代码：keyboard.py / keyboard_utils.py / keymap.py
+├─ src\                       # 运行期代码：keyboard.py / keyboard_utils.py / device_profile\（设备包）
 │  ├─ win32_compat.py         # pywin32 缺失时的兼容层
 │  ├─ app_paths.py            # 源码与打包两种形态的路径处理
 │  └─ run_keyboard.py         # 写日志后启动 keyboard.main()（计划任务入口）

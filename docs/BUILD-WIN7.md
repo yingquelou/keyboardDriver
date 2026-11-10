@@ -92,7 +92,7 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 | 参数 | 作用 |
 |---|---|
 | `src\run_keyboard.py` | 入口：写 `logs\keyboard.log` 后调用 `keyboard.main()`。直接打 `src\keyboard.py` 也可运行，但不会写日志 |
-| `--paths src` | 把 `src\` 加入模块搜索路径（`app_paths`、`keyboard_utils`、`keymap`、`win32_compat`） |
+| `--paths src` | 把 `src\` 加入模块搜索路径（`app_paths`、`keyboard_utils`、`device_profile`、`win32_compat`） |
 | `--hidden-import usb.backend.libusb1` | pyusb 的后端是运行时动态选择，静态分析看不到，必须显式声明 |
 | `--hidden-import app_paths` | 同上，避免漏收 |
 | `--add-binary "...;."` | 把 libusb DLL 放进产物（onedir 落在 exe 同级；onefile 落进 `_MEIPASS`） |

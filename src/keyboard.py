@@ -9,12 +9,13 @@ import app_paths
 app_paths.prepare_native_dlls()
 
 import usb.core
+import device_profile as profile
 from keyboard_utils import (
     find_device, configure_device, read_report, find_consumer_endpoint,
     read_consumer_report, parse_keyboard_report, parse_consumer_report,
     simulate_modifiers, simulate_keys, simulate_key,
     simulate_consumer_usage, update_key_repeats, release_all_keys,
-    has_active_keys, read_lock_bitmap, write_led_bitmap, LED_POLL_INTERVAL_S,
+    has_active_keys, read_lock_bitmap, write_led_bitmap,
     get_device_product, get_current_layer_name
 )
 
@@ -24,7 +25,7 @@ IDLE_READ_TIMEOUT_MS = 100
 ACTIVE_READ_TIMEOUT_MS = 2
 
 # ---------- 消费类按键线程 ----------
-# 音量/多媒体/浏览器键由消费类接口（Usage Page 0x0C）上报，与键盘接口分开。
+# 音量/多媒体/浏览器键由消费类接口上报，与键盘接口分开。
 # 用独立线程读取，避免阻塞键盘主循环；设备节点由描述符角色 + 探测读确定，
 # 不依赖枚举顺序和写死的接口号。
 def consumer_loop(dev, ep, stop_event):
@@ -49,7 +50,7 @@ def consumer_loop(dev, ep, stop_event):
 
 # ---------- 指示灯线程 ----------
 # 位图完全由系统真实锁定状态计算，不维护影子状态：
-#   启动先同步一次，之后每 200ms 兜底轮询，锁定状态一变就立即写。
+#   启动先同步一次，之后按 device_profile.LED_POLL_INTERVAL_S 兜底轮询，锁定状态一变就立即写。
 # 写失败按 5 秒限流告警并在下一轮重试；任何异常都不会影响按键主循环。
 def led_loop(dev, stop_event):
     last_bitmap = None
@@ -68,7 +69,7 @@ def led_loop(dev, stop_event):
                 if now - last_warn > 5:
                     print(f"[警告] 指示灯写入失败: {e}（5 秒内不再重复告警）")
                     last_warn = now
-        stop_event.wait(LED_POLL_INTERVAL_S)
+        stop_event.wait(profile.LED_POLL_INTERVAL_S)
 
 # ---------- 主循环（处理按键） ----------
 def process_loop(dev, ep, enable_led=False):
@@ -88,7 +89,8 @@ def process_loop(dev, ep, enable_led=False):
     else:
         print("[提示] 未找到可读的消费类接口，媒体键/音量键不可用。")
 
-    # 指示灯同步线程：默认关闭。本设备在 WinUSB 接管模式下写灯返回成功但灯无反应，
+    # 指示灯同步线程：默认值由设备模块声明（LED_SUPPORTED）。
+    # 本设备在 WinUSB 接管模式下写灯返回成功但灯无反应，因此默认关闭；
     # 只有显式 --led 才启用，避免无意义的小流量与日志噪音。
     led_thread = None
     if enable_led:
@@ -96,7 +98,8 @@ def process_loop(dev, ep, enable_led=False):
         led_thread.start()
         print("[信息] 指示灯同步已启用（--led）")
     else:
-        print("[信息] 指示灯同步未启用（本设备接管模式下写灯无效果，如需尝试请加 --led）")
+        reason = profile.LED_UNAVAILABLE_HINT if not profile.LED_SUPPORTED else "设备默认关闭"
+        print(f"[信息] 指示灯同步未启用（{reason}，如需尝试请加 --led）")
 
     print(f"开始监听键盘，当前层: {get_current_layer_name()}，按 Ctrl+C 退出。")
     try:
@@ -133,7 +136,13 @@ def process_loop(dev, ep, enable_led=False):
 # ---------- 主程序（带自动重连） ----------
 def main():
     print("启动正常模式...")
-    enable_led = '--led' in sys.argv[1:]   # 指示灯同步默认关闭，见 process_loop 内说明
+    # 指示灯默认值由设备模块声明：--led 强制开启，--no-led 强制关闭
+    if '--led' in sys.argv[1:]:
+        enable_led = True
+    elif '--no-led' in sys.argv[1:]:
+        enable_led = False
+    else:
+        enable_led = profile.LED_SUPPORTED
     retry_interval = 5
     while True:
         try:
