@@ -8,10 +8,9 @@
 - 方法签名：实现的方法参数个数与契约一致（少一个/多一个都算不合格）；
 - 键盘报告：长度为正、修饰键与键槽区间自洽、残包返回 ``(0, None)``、读取长度覆盖；
 - 消费类报告：Report ID 与 usage 布局自洽、按 Report ID 过滤、长度不足丢弃；
-- 键表与层：层顺序覆盖全部层、默认层在顺序内、子表被层完整覆盖、
-  层切换键不出现在任何映射表中、轮转 N 次回到起始层；
-- 重复策略：``None`` 不重复、锁定键不重复、声明可重复的消费键可重复；
-- 指示灯：报告长度固定、位图截断正确；默认关闭时给出不可用说明。
+- 通用映射：hid_usage 覆盖字母区与小键盘 usage（0x0D 与 0x59 并存）、未映射返回
+  ``None``、锁定键/可重复消费键的语义正确、包里不再暴露任何"层"概念；
+- 指示灯：报告长度固定、Report ID 处理正确、位图截断正确、位定义合法。
 
 用法：
     python tools\\check_device_profile.py
@@ -27,6 +26,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import device_profile as profile
+import hid_usage
+from device_profile import win32con
 from device_profile.contract import KeyboardDevice
 
 _passed = 0
@@ -157,85 +158,73 @@ def check_consumer_report():
           profile.parse_consumer_report(short) is None)
 
 
-def check_layers():
-    print("\n== 6. 键表与层 ==")
-    layers = profile.LAYERS
-    order = tuple(profile.LAYER_ORDER)
-    if not check('LAYERS 为非空映射', isinstance(layers, dict) and bool(layers), repr(type(layers))):
-        return
-    check('LAYER_ORDER 与 LAYERS 的层集合一致',
-          set(order) == set(layers), '%r vs %r' % (order, sorted(layers)))
-    check('DEFAULT_LAYER_NAME 在层顺序内',
-          profile.DEFAULT_LAYER_NAME in order, repr(profile.DEFAULT_LAYER_NAME))
-    for layer_name in order:
-        layer = layers.get(layer_name) or {}
-        check("层 %r 非空且值为整数" % layer_name,
-              bool(layer) and all(isinstance(vk, int) for vk in layer.values()),
-              repr(layer.get(layer_name)))
-
-    subsets = profile.PROFILE.keymap_subsets
-    if not subsets:
-        print("[SKIP] 该设备未声明 keymap_subsets，跳过子表覆盖检查")
-    for subset_name, subset in subsets.items():
-        covered = any(all(layer.get(hid) == vk for hid, vk in subset.items())
-                      for layer in layers.values())
-        check('子表 %s 被某一层完整覆盖' % subset_name, covered,
-              '子表有 %d 项' % len(subset))
-
-    toggle = profile.LAYER_TOGGLE_HID
-    if toggle is None:
-        check('未声明层切换键时 is_layer_toggle 恒为假',
-              not profile.is_layer_toggle(0x53))
-    else:
-        check('层切换键本身被识别', profile.is_layer_toggle(toggle))
-        check('其它 HID 码不被误判为层切换键',
-              not profile.is_layer_toggle(toggle ^ 0x01))
-        hit_layers = [name for name, layer in layers.items() if toggle in layer]
-        check('层切换键不出现在任何映射表中', not hit_layers,
-              '出现在 %r' % hit_layers)
-
-    current = profile.DEFAULT_LAYER_NAME
-    for _ in range(len(order)):
-        current = profile.next_layer_name(current)
-    check('层轮转 %d 次回到起始层' % len(order),
-          current == profile.DEFAULT_LAYER_NAME, repr(current))
-
-    first_layer = layers[order[0]]
-    sample_hid, sample_vk = next(iter(first_layer.items()))
-    check('get_vk 能按层取到映射值',
-          profile.get_vk(order[0], sample_hid) == sample_vk)
-    check('get_vk 对未映射键返回 None',
-          profile.get_vk(order[0], 0xFFFF) is None)
+def check_usage_map():
+    print("\n== 6. 通用 usage 映射（hid_usage） ==")
+    check('device_profile 不再暴露层概念',
+          not any(hasattr(profile, n) for n in
+                  ('LAYERS', 'LAYER_ORDER', 'DEFAULT_LAYER_NAME', 'LAYER_TOGGLE_HID',
+                   'is_layer_toggle', 'next_layer_name', 'keymap_subsets')))
+    keymap = hid_usage.KEYMAP
+    check('KEYMAP 为非空映射', isinstance(keymap, dict) and bool(keymap),
+          repr(type(keymap)))
+    check('KEYMAP 的值全为整数 VK',
+          all(isinstance(vk, int) for vk in keymap.values()))
+    # 设备在 Num Lock 灯位为 1 时把字母区改报成小键盘 usage，
+    # 因此这两组必须同时存在，主机才不需要"层"。
+    check('字母区 usage（0x04..0x1D）全部可映射',
+          all(0x04 + i in keymap for i in range(26)))
+    check('小键盘 usage（0x59..0x63）全部可映射',
+          all(0x59 + i in keymap for i in range(11)))
+    check('0x0D -> VK_J', keymap.get(0x0D) == ord('J'), repr(keymap.get(0x0D)))
+    check('0x59 -> VK_NUMPAD1', keymap.get(0x59) == win32con.VK_NUMPAD1,
+          repr(keymap.get(0x59)))
+    check('0x53 -> VK_NUMLOCK（锁定键按 usage 转发）',
+          keymap.get(0x53) == win32con.VK_NUMLOCK, repr(keymap.get(0x53)))
+    check('未映射 usage 返回 None', hid_usage.get_vk(0xFFFF) is None)
+    check('消费类映射非空且音量键可映射',
+          bool(hid_usage.CONSUMER)
+          and hid_usage.get_consumer_vk(0xE9) == win32con.VK_VOLUME_UP,
+          repr(hid_usage.get_consumer_vk(0xE9)))
+    check('未映射消费类 usage 返回 None',
+          hid_usage.get_consumer_vk(0xFFFF) is None)
 
 
 def check_policy():
-    print("\n== 7. 重复策略与指示灯 ==")
-    check('repeats_key(None) 为假', profile.repeats_key(None) is False)
-    for vk in profile.NO_REPEAT_VKS:
+    print("\n== 7. 重复语义与指示灯 ==")
+    check('repeats_key(None) 为假', hid_usage.repeats_key(None) is False)
+    for vk in hid_usage.NO_REPEAT_VKS:
         check('免重复键 0x%02X 不参与重复' % vk,
-              profile.repeats_key(vk) is False)
-    for vk in profile.CONSUMER_REPEAT_VKS:
+              hid_usage.repeats_key(vk) is False)
+    for vk in hid_usage.CONSUMER_REPEAT_VKS:
         check('消费类重复键 0x%02X 参与重复' % vk,
-              profile.repeats_consumer(vk) is True)
+              hid_usage.repeats_consumer(vk) is True)
     check('未声明的消费类键不参与重复',
-          profile.repeats_consumer(0) is False)
+          hid_usage.repeats_consumer(0) is False)
 
     length = profile.LED_REPORT_LENGTH
     report = profile.led_report(0xFF)
     check('led_report 返回固定长度的 bytes',
           isinstance(report, bytes) and len(report) == length, repr(report))
+    if profile.LED_REPORT_ID:
+        check('led_report 首字节为 Report ID',
+              report[0] == profile.LED_REPORT_ID, repr(report))
+        check('带 Report ID 时长度 = 1 + 报告长度',
+              len(report) == length + 1, repr(report))
+    else:
+        check('无 Report ID 时首字节即位图', len(report) == length, repr(report))
     mask = (1 << (8 * length)) - 1 if length > 0 else 0
     check('led_report 按报告长度截断位图',
-          int.from_bytes(profile.led_report(0x1FF), 'little') == (0x1FF & mask),
-          repr(profile.led_report(0x1FF)))
+          int.from_bytes(report[-length:], 'little') == (0xFF & mask),
+          repr(report))
     for bit, vk in profile.LED_BITS:
         check('LED 位定义 (0x%02X -> VK 0x%02X) 合法' % (bit, vk),
               isinstance(bit, int) and isinstance(vk, int) and bit > 0)
-    if not profile.LED_SUPPORTED:
-        check('默认关闭指示灯时给出不可用说明',
-              isinstance(profile.LED_UNAVAILABLE_HINT, str)
-              and bool(profile.LED_UNAVAILABLE_HINT.strip()),
-              repr(profile.LED_UNAVAILABLE_HINT))
+    if profile.LED_SUPPORTED:
+        check('声明支持指示灯时位定义为非空', bool(profile.LED_BITS))
+        check('LED 轮询间隔为正数',
+              isinstance(profile.LED_POLL_INTERVAL_S, (int, float))
+              and profile.LED_POLL_INTERVAL_S > 0,
+              repr(profile.LED_POLL_INTERVAL_S))
 
 
 def main():
@@ -245,7 +234,7 @@ def main():
     check_signatures()
     check_key_report()
     check_consumer_report()
-    check_layers()
+    check_usage_map()
     check_policy()
 
     print("\n---- 结果：%d 项通过，%d 项失败 ----" % (_passed, len(_failures)))
