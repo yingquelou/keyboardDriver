@@ -117,135 +117,101 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 `keyboard.py`、`keyboard_utils.py`、`run_keyboard.py` 只调用这个包，不含任何本键盘的
 常量或分支——换键盘时**只改这个包**（保持包名与导出名不变，它是唯一的设备插槽）。
 
-包内按职责拆分，导出名保持不变：
+包内用**契约基类**约束"一把键盘设备应该提供什么"：
 
-| 文件 | 内容 | 典型改动 |
-|---|---|---|
-| `identity.py` | VID/PID、接口判定、端点预期 | 换设备身份或接口类/子类/协议 |
-| `reports.py` | 键盘报告布局与解析、消费类 Report ID/usage、读取长度 | 报告格式不同 |
-| `keys.py` | `C` / `XL` / `XN` / `CONSUMER` 映射表、层与层切换键 | **键位映射（最常见）** |
-| `policy.py` | 自动重复规则、指示灯能力 | 行为策略不同 |
+| 文件 | 作用 |
+|---|---|
+| `contract.py` | `KeyboardDevice`：七组能力契约，必需项为 `@abstractmethod` |
+| `device.py` | `Wireless1EA7_0066`：当前键盘对契约的实现（只做装配） |
+| `identity.py` / `reports.py` / `keys.py` / `policy.py` | 实测数据与算法（换键盘改这里的值） |
+| `_win32.py` | 私有：`win32con` 入口与 VK 补全 |
 
-（`__init__.py` 只做导出，`_win32.py` 是私有兼容层；详见 `src\device_profile\README.md`。）
+`__init__.py` 实例化 `PROFILE = Wireless1EA7_0066()`（运行时单设备、单进程），再把契约成员
+绑成模块级别名（`NAME` ← `name`、`KEY_REPORT_LENGTH` ← `key_report_length` …），因此通用代码
+的导入与调用方式完全不变，`__all__` 仍是 49 项。
 
 步骤：
 
 1. 备份现有 `src\device_profile\` 目录（换回时可原样恢复）；
-2. 按下面的必需项清单改写导出名，多数情况只改 `keys.py` 的映射表（`tools\calibrate.py` 会打印每个键的 HID 码）；
-3. 用 `tools\probe_keyboard.py`、`tools\enum_usb_nodes.py` 核对接口角色、报告长度与 Report ID；
-4. 直接运行 `src\keyboard.py` 验证，不需要改动其它源码。
+2. 按实测值改 `identity.py` / `reports.py` / `keys.py` / `policy.py`，多数情况只改
+   `keys.py` 的映射表（`tools\calibrate.py` 会打印每个键的 HID 码）；
+3. 只有某组能力的**形状**与基类默认不同（报告带 Report ID、层切换键/消费类取舍规则不同）
+   时，才在 `device.py` 覆写对应成员；否则不用动它；
+4. 跑 `python tools\check_device_profile.py`，确认 0 项失败；
+5. 用 `tools\probe_keyboard.py`、`tools\enum_usb_nodes.py` 核对接口角色、报告长度与 Report ID，
+   再运行 `src\keyboard.py` 上真机。
 
-### 必需项（导出名与用途）
+### 契约（七组能力）
 
-函数的返回值就是通用代码唯一的取值入口；布局常量（报告长度、槽区间等）主要供设备包内部
-使用，改新键盘时用来描述实测格式。
+子类只需覆写与实测值有关的成员；"默认"列是基类给出的语义，等价于"该设备没有这项能力"。
+带 ★ 的是必需项，缺一个就在实例化时直接 `TypeError`（`abc` 的运行时强制，不是注释约定）。
 
-| 名称 | 类型 | 说明 |
-|---|---|---|
-| `NAME` / `VID` / `PID` | str / int / int | 显示名与枚举过滤条件 |
-| `is_keyboard_interface(setting)` | bool | 键盘接口识别（本键盘为 HID 类 3/子类 1/协议 1） |
-| `is_consumer_interface(setting)` | bool | 消费类接口候选（本键盘为 HID 且非 boot 键盘） |
-| `ENDPOINT_DIRECTION` / `ENDPOINT_TYPE` | str | `'in'`/`'out'`、`'interrupt'`/`'bulk'`/`'isochronous'` |
-| `KEY_REPORT_LENGTH` / `MODIFIER_BYTE_INDEX` | int | 报告长度与修饰键位图位置（`parse_key_report` 内部使用） |
-| `KEY_SLOT_START` / `KEY_SLOT_END` | int | 键码槽区间（左闭右开） |
-| `parse_key_report(raw)` | `(int, list[int] or None)` | 返回 (修饰键字节, 键码列表)；长度不足返回 `(0, None)` |
-| `key_report_read_size(max_packet_size)` | int | 单次读取长度，至少覆盖完整报告 |
-| `CONSUMER_USAGE_PAGE` | int | 消费类集合的 Usage Page（HID 规范值 `0x0C`） |
-| `choose_consumer_report(items)` | `(report_id, usage_bytes)` 或 `None` | 从描述符 Input 项 `(usage_page, report_id, report_size_bits)` 中选出消费类报告 |
-| `consumer_report_read_size(max_packet_size)` | int | 消费类单次读取长度 |
-| `parse_consumer_report(raw)` | int 或 None | 按 Report ID 过滤混流报文后返回 usage |
-| `LAYERS` / `DEFAULT_LAYER_NAME` | dict / str | 层名 → `{HID: VK}`；启动层名 |
-| `get_vk(layer_name, hid_code)` | int 或 None | 按层取虚拟键码 |
-| `get_consumer_vk(usage)` | int 或 None | 消费类 usage → 虚拟键码 |
-| `is_layer_toggle(hid_code)` | bool | 是否为层切换键（不注入、不重复） |
-| `next_layer_name(current_name)` | str | 下一层；只有一层时返回原名（等于不切换） |
-| `repeats_key(vk)` | bool | 普通键/修饰键是否参与自动重复 |
-| `repeats_consumer(vk)` | bool | 消费类键是否参与长按重复 |
-| `LED_SUPPORTED` / `LED_UNAVAILABLE_HINT` | bool / str | 是否声明指示灯可用；关闭时打印的说明 |
-| `LED_REPORT_LENGTH` / `LED_BITS` / `LED_POLL_INTERVAL_S` | int / tuple / float | 输出报告长度、`(bit, vk)` 位序、轮询间隔 |
-| `led_report(bitmap)` | bytes | 把 LED 位图打包成 HID 输出报告 |
+| 组 | 契约成员 | 必需 | 默认 / 说明 |
+|---|---|---|---|
+| 身份 | `name` / `vid` / `pid` | ★ | 设备显示名与枚举过滤条件 |
+| 接口角色 | `is_keyboard_interface(setting)` | ★ | 按描述符判定，不按接口号 |
+| | `is_consumer_interface(setting)` | | HID 类且非键盘接口 |
+| | `endpoint_direction` / `endpoint_type` | | `'in'` / `'interrupt'` |
+| 键盘报告 | `key_report_length` / `parse_key_report(raw)` / `key_report_read_size(n)` | ★ | 报告长度、解析（残包返回 `(0, None)`）、单次读取长度 |
+| | `modifier_byte_index` / `key_slot_start` / `key_slot_end` / `key_report_has_id` | | `0` / `2` / 报告长度 / `False`（仅描述布局，供自检核对） |
+| 消费类报告 | `choose_consumer_report(items)` / `parse_consumer_report(raw)` / `consumer_report_read_size(n)` | | 恒 `None` / 恒 `None` / 覆盖 Report ID + usage；本键盘按 Report Size ≥ 16 位取舍、按 Report ID 1 过滤 |
+| | `consumer_usage_page` / `consumer_report_id` / `consumer_report_id_size` / `consumer_usage_size` / `consumer_usage_bits` / `consumer_usage_byte_order` | | `0x0C` / `1` / `1` / `2` / `16` / `'little'` |
+| 键表与层 | `layers` | ★ | 层名 → `{HID usage: VK}`，至少一层 |
+| | `layer_order` / `default_layer_name` / `layer_toggle_hid` | | `layers` 顺序 / 第一层 / `None`（无层切换键） |
+| | `is_layer_toggle` / `next_layer_name` / `get_vk` / `consumer_map` / `get_consumer_vk` / `keymap_subsets` | | 全部有默认实现；`keymap_subsets` 仅供自检核对子表覆盖 |
+| 重复策略 | `no_repeat_vks` / `repeat_consumer_vks` / `repeats_key(vk)` / `repeats_consumer(vk)` | | 空集 / 空 / 非空即可重复 / 不在集合内 |
+| 指示灯能力 | `led_supported` / `led_report_length` / `led_poll_interval_s` / `led_bits` / `led_unavailable_hint` / `led_report(bitmap)` | | `False`（默认关闭，只有 `--led` 才尝试）/ `1` / `0.2` / `()` / `''` / 按长度小端截断 |
 
-### 可选能力
-
-- **没有消费类接口**：`is_consumer_interface` 返回 `False` 即可；程序打印“未找到可读的
-  消费类接口”后继续只跑键盘，不影响主流程。
-- **没有层切换**：`LAYERS` 只放一层、`is_layer_toggle` 恒返回 `False`、`next_layer_name` 返回原名。
-- **没有指示灯**：`LED_SUPPORTED = False`、`LED_BITS = ()`；`LED_REPORT_LENGTH` 与
-  `led_report` 仍需存在（默认不启用，只有 `--led` 才会走到）。
-- **报告带 Report ID 或长度不同**：只改 `KEY_REPORT_LENGTH` / `MODIFIER_BYTE_INDEX` /
-  槽区间与 `parse_key_report` 的取值偏移。
-- **消费类 usage 不是 16 位小端**：改 `parse_consumer_report` 的切片与字节序。
+模块级导出名不变（通用代码用 `NAME`、`LAYERS`、`LED_SUPPORTED` … 取值，分别对应
+`name`、`layers`、`led_supported`）——**调用方不需要改**。`KeyboardDevice` 与 `PROFILE`
+可以直接导入，但不进 `__all__`。
 
 ### 最小骨架
 
-按文件填下面内容（省略号处补实现）即可跑通主流程，`__init__.py` 的导出清单不用改：
-
-`identity.py`
-
-```python
-NAME, VID, PID = "示例键盘", 0x1234, 0x5678
-ENDPOINT_DIRECTION, ENDPOINT_TYPE = 'in', 'interrupt'
-
-def is_keyboard_interface(setting): ...
-def is_consumer_interface(setting): ...
-```
-
-`reports.py`
+只实现三个必需方法 + 两个必需属性就能实例化，其余能力走基类默认（无消费类、无层切换、
+所有键可重复、无指示灯）：
 
 ```python
-CONSUMER_USAGE_PAGE = 0x0C
-KEY_REPORT_LENGTH, MODIFIER_BYTE_INDEX = 8, 0
-KEY_SLOT_START, KEY_SLOT_END = 2, 8
+from .contract import KeyboardDevice
 
-def parse_key_report(raw):
-    if raw is None or len(raw) < KEY_REPORT_LENGTH:
-        return 0, None
-    data = bytes(raw)
-    return data[0], [b for b in data[KEY_SLOT_START:KEY_SLOT_END] if b]
+class ExampleKeyboard(KeyboardDevice):
+    name = "示例键盘"
+    vid, pid = 0x1234, 0x5678
+    key_report_length = 8
+    layers = {'default': {0x04: ord('A')}}
 
-def key_report_read_size(max_packet_size):
-    return max(KEY_REPORT_LENGTH, max_packet_size)
+    def is_keyboard_interface(self, setting):
+        return (setting.bInterfaceClass == 3
+                and setting.bInterfaceSubClass == 1
+                and setting.bInterfaceProtocol == 1)
 
-def choose_consumer_report(items): ...
-def consumer_report_read_size(max_packet_size): ...
-def parse_consumer_report(raw): ...
+    def parse_key_report(self, raw):
+        data = bytes(raw or b'')
+        if len(data) < self.key_report_length:
+            return 0, None
+        return data[0], [b for b in data[2:8] if b]
+
+    def key_report_read_size(self, max_packet_size):
+        return max(self.key_report_length, max_packet_size)
 ```
 
-`keys.py`
+要声明消费类、层切换键、重复策略或指示灯能力时，覆写上表对应成员即可——默认实现都在
+`contract.py` 里，docstring 写明了各自语义。
 
-```python
-LAYERS = {'default': {0x04: ord('A')}}
-DEFAULT_LAYER_NAME = 'default'
-CONSUMER = {}
+### 一致性自检
 
-def get_vk(layer_name, hid_code):
-    return LAYERS.get(layer_name, {}).get(hid_code)
+`python tools\check_device_profile.py` 纯离线（不打开设备），检查：
 
-def get_consumer_vk(usage):
-    return CONSUMER.get(usage)
+- 基类不可直接实例化、实现类没有残留 abstract 成员；
+- 身份字段类型与范围；每个方法的参数个数与契约一致；
+- 报告长度为正、修饰键与键槽区间自洽、残包返回 `(0, None)`、读取长度覆盖报告；
+- 消费类 Report ID/usage 布局自洽，Report ID 不符或长度不足的报文被丢弃；
+- 层顺序覆盖全部层、默认层在顺序内、`keymap_subsets` 的每个子表被某一层完整覆盖、
+  **层切换键不出现在任何映射表中**、轮转 N 次回到起始层；
+- `None` 与锁定键不重复、声明可重复的消费类键可重复；
+- `led_report` 长度固定且位图截断正确，默认关闭时给出不可用说明。
 
-def is_layer_toggle(hid_code):
-    return False
-
-def next_layer_name(current_name):
-    return current_name
-```
-
-`policy.py`
-
-```python
-def repeats_key(vk):
-    return vk is not None
-
-def repeats_consumer(vk):
-    return False
-
-LED_SUPPORTED, LED_UNAVAILABLE_HINT = False, "示例键盘未声明指示灯能力"
-LED_REPORT_LENGTH, LED_BITS, LED_POLL_INTERVAL_S = 1, (), 0.2
-
-def led_report(bitmap):
-    return bytes([bitmap & 0xFF])
-```
+退出码 0 表示全部通过；新增/更换键盘后必须先跑它，再上真机。
 
 ## 媒体键
 
@@ -298,6 +264,7 @@ def led_report(bitmap):
 
 | 脚本 | 用途 |
 |---|---|
+| `tools\check_device_profile.py` | 离线一致性自检：验证当前设备实现是否完整满足 `KeyboardDevice` 契约（必需项、签名、报告长度、层表覆盖、层切换键、消费类过滤、重复/LED 默认语义） |
 | `tools\probe_keyboard.py` | 无侵入枚举：接口/端点/包长/报告描述符，核对消费类集合与 Report ID |
 | `tools\calibrate.py` | 逐个按键打印 HID 码 → VK 名，核对映射与层切换 |
 | `tools\compare_native.py` | `record` 用底层键盘钩子记录原生/本实现的 VK 序列（含重复节奏），`compare` 输出差异清单 |
