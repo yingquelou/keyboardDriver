@@ -91,3 +91,21 @@ def parse_consumer_report(raw):
     start = CONSUMER_REPORT_ID_SIZE
     return int.from_bytes(data[start:start + CONSUMER_USAGE_SIZE],
                           CONSUMER_USAGE_BYTE_ORDER)
+
+
+# ============================================================
+# 指示灯输出报告（LED Page 0x08）
+# ============================================================
+# 键盘接口的输出报告来自报告描述符的 Output 主项：
+#   05 08（Usage Page LED）19 01 29 05 15 00 25 01 95 05 75 01 91 02
+#   → 5 个 1 位输出字段（Num/Caps/Scroll/Compose/Kana），再 3 位常量填充 = 1 字节，无 Report ID。
+LED_REPORT_ID = 0
+LED_REPORT_LENGTH = 1
+# (位, 对应锁定状态的 VK)；位序按 HID 输出报告定义
+LED_BITS = (
+    (0x01, 0x90),      # Num Lock
+    (0x02, 0x14),      # Caps Lock
+    (0x04, 0x91),      # Scroll Lock
+)
+# 锁定状态轮询间隔：只读系统状态，状态不变就不写 USB；10ms 让切层延迟接近原生。
+LED_POLL_INTERVAL_S = 0.01

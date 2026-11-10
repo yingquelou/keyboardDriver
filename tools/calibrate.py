@@ -9,16 +9,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import usb.core
 from keyboard_utils import (
     find_device, configure_device, read_report, parse_keyboard_report,
-    get_vk_name, get_vk, get_current_layer_name
+    get_vk_name, get_vk
 )
 
 def calibrate_mode(dev, ep):
     prev_modifier = 0
     prev_keys = []
     print("\n=== 键盘校准模式（信息查看） ===")
-    print(f"当前层: {get_current_layer_name()}")
-    print("按下按键，程序会显示其 HID 键码和当前映射的虚拟键码名称。")
-    print("如需修改映射，请手动编辑 src\\device_profile\\keys.py 中的 C/XL/XN 表。")
+    print("按下按键，程序会显示其 HID 键码和按 HID Usage Tables 换出的虚拟键码名称。")
+    print("注意：设备在 Num Lock 灯位为 1 时会把字母区改报成小键盘 usage，")
+    print("      所以同一个物理键在两种锁定状态下会显示不同的键码，这是正常现象。")
     print("按 Ctrl+C 退出校准模式。\n")
 
     try:
@@ -39,7 +39,7 @@ def calibrate_mode(dev, ep):
                 new_keys = [k for k in current_keys if k not in prev_keys]
                 if new_keys:
                     hid_code = new_keys[0]
-                    vk = get_vk(hid_code)  # 根据当前层获取映射
+                    vk = get_vk(hid_code)  # 通用 HID Usage Tables 映射
                     if vk is not None:
                         name = get_vk_name(vk)
                         print(f"键码 0x{hid_code:02X} -> {name}")

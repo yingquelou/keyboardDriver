@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """当前设备（1EA7:0066 无线键盘）对 ``KeyboardDevice`` 契约的实现。
 
-本文件只做**装配**：把契约成员接到 identity / reports / keys / policy 四个职责模块，
-自身不含新的数据或算法。因此换键盘时依旧只改那四个模块的实测值；
-只有当某组能力的**形状**与默认实现不同（例如消费类取舍规则、层切换键）时，
-才在下面覆写对应成员。
+本文件只做**装配**：把契约成员接到 identity / reports 两个职责模块，
+自身不含新的数据或算法。usage→VK 换算与自动重复语义不在这里（见 ``src/hid_usage.py``）：
+固件自己按 Num Lock 灯位切换上报的 usage，主机侧按 HID Usage Tables 通用解释即可。
 
 运行时仍然是单设备、单进程：包入口只实例化本类一次。
 """
 
-from . import identity, keys, policy, reports
+from . import identity, reports
 from .contract import KeyboardDevice
 
 
 class Wireless1EA7_0066(KeyboardDevice):
-    """1EA7:0066 无线键盘（Win7 WinUSB 接管，boot 键盘接口 + 消费类集合）。"""
+    """1EA7:0066 无线键盘（WinUSB 接管，boot 键盘接口 + 消费类集合）。"""
 
     # ---- 1. 身份 ----
     name = identity.NAME
@@ -68,46 +67,12 @@ class Wireless1EA7_0066(KeyboardDevice):
         """首字节非 Report ID 1 的报文（鼠标/厂商报文）一律丢弃。"""
         return reports.parse_consumer_report(raw)
 
-    # ---- 5. 键表与层 ----
-    layers = keys.LAYERS
-    layer_order = keys.LAYER_ORDER
-    default_layer_name = keys.DEFAULT_LAYER_NAME
-    # 0x53（数字锁定键位）：只切换映射层，不注入、不改系统 Num Lock、不重复。
-    layer_toggle_hid = keys.LAYER_TOGGLE_HID
-    consumer_map = keys.CONSUMER
-    # C/XL/XN 是维护用的三个子集，合并成 letter / number 两层；自检会核对覆盖关系。
-    keymap_subsets = {'C': keys.C, 'XL': keys.XL, 'XN': keys.XN}
-
-    def is_layer_toggle(self, hid_code):
-        return keys.is_layer_toggle(hid_code)
-
-    def next_layer_name(self, current_name):
-        return keys.next_layer_name(current_name)
-
-    def get_vk(self, layer_name, hid_code):
-        return keys.get_vk(layer_name, hid_code)
-
-    def get_consumer_vk(self, usage):
-        return keys.get_consumer_vk(usage)
-
-    # ---- 6. 重复策略 ----
-    # 锁定键不参与重复；消费类只有音量键长按补发。
-    no_repeat_vks = policy.NO_REPEAT_VKS
-    repeat_consumer_vks = policy.CONSUMER_REPEAT_VKS
-
-    def repeats_key(self, vk):
-        return policy.repeats_key(vk)
-
-    def repeats_consumer(self, vk):
-        return policy.repeats_consumer(vk)
-
-    # ---- 7. 指示灯能力 ----
-    # 实测：写灯返回成功但物理指示灯无反应（接口 0 只有 IN 端点），默认关闭。
-    led_supported = policy.LED_SUPPORTED
-    led_report_length = policy.LED_REPORT_LENGTH
-    led_poll_interval_s = policy.LED_POLL_INTERVAL_S
-    led_bits = policy.LED_BITS
-    led_unavailable_hint = policy.LED_UNAVAILABLE_HINT
-
-    def led_report(self, bitmap):
-        return policy.led_report(bitmap)
+    # ---- 5. 指示灯输出报告 ----
+    # 实测（2026-11-10，WinUSB 接管）：Output 主项为 5 位 LED + 3 位填充 = 1 字节，
+    # 无 Report ID。写 Num Lock 位后设备立即把字母区改报小键盘 usage（J: 0x0D → 0x59），
+    # 写回 0 后恢复，因此灯位回写是**功能必需**，不再是可选的装饰。
+    led_supported = True
+    led_report_id = reports.LED_REPORT_ID
+    led_report_length = reports.LED_REPORT_LENGTH
+    led_poll_interval_s = reports.LED_POLL_INTERVAL_S
+    led_bits = reports.LED_BITS

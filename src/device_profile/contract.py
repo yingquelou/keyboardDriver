@@ -6,17 +6,19 @@ Protocol 只在类型检查器里生效，运行时缺项不会报错；而这�
 （换键盘时漏实现一项就要立刻发现），所以用继承 + ``@abstractmethod``，
 缺任何必需项时实例化直接 ``TypeError``。
 
-契约分七组，顺序如下：
+契约只描述**报告布局类事实**（设备侧不可推导的东西），分五组：
 
 1. 身份 —— ``name`` / ``vid`` / ``pid``
 2. 接口角色 —— ``is_keyboard_interface`` / ``is_consumer_interface`` / 端点预期
 3. 键盘报告 —— 布局元数据 + ``parse_key_report`` + 读取长度
 4. 消费类报告 —— Report ID / usage 布局 + 取舍规则 + 解析 + 读取长度（可选）
-5. 键表与层 —— 层表、层顺序、层切换键与切层语义
-6. 重复策略 —— 哪些键参与自动重复（可选）
-7. 指示灯能力 —— 输出报告打包与轮询能力（可选）
+5. 指示灯输出报告 —— Report ID / 长度 / 位定义（可选）
 
-只有"没有它就跑不起来"的成员是 ``@abstractmethod``；第 4、6、7 组属于可选能力，
+usage→VK 的换算、自动重复语义、锁定键处理都不属于设备事实，统一放在
+``src/hid_usage.py``，由主机侧按 HID Usage Tables 通用处理——与 Windows 原生
+HID 键盘类的分工一致：固件自己决定上报哪些 usage，主机只做通用解释。
+
+只有"没有它就跑不起来"的成员是 ``@abstractmethod``；第 4、5 组属于可选能力，
 基类给出默认实现，默认值等价于"该设备没有这项能力"。子类覆写即可声明具备该能力，
 并在覆写处的 docstring 里说明本设备的实测语义。
 """
@@ -99,6 +101,7 @@ class KeyboardDevice(ABC):
 
         必须与 ``parse_key_report`` 的判定一致：不足这个长度视为残包。
         """
+        # 注意：与"设备专有"无关，这里只记录实测布局（例如 8 字节 boot 报告）。
 
     @property
     def modifier_byte_index(self):
@@ -188,101 +191,22 @@ class KeyboardDevice(ABC):
         return None
 
     # ============================================================
-    # 5. 键表与层
-    # ============================================================
-    @property
-    @abstractmethod
-    def layers(self):
-        """层名 → ``{HID usage: VK}`` 的映射表，至少一层，且每层非空。"""
-
-    @property
-    def layer_order(self):
-        """层的轮转顺序（可迭代的层名序列）。默认取 ``layers`` 的插入顺序。"""
-        return tuple(self.layers)
-
-    @property
-    def default_layer_name(self):
-        """启动时的层名。默认 ``layer_order`` 的第一个。"""
-        order = tuple(self.layer_order)
-        return order[0] if order else ''
-
-    @property
-    def layer_toggle_hid(self):
-        """层切换键的 HID usage；``None`` 表示该设备没有层切换键（默认）。"""
-        return None
-
-    def is_layer_toggle(self, hid_code):
-        """是否为层切换键。默认与 ``layer_toggle_hid`` 比较，未声明时恒 ``False``。
-
-        层切换键的语义由通用代码保证：只在"上一份报告未按下 → 本次按下"时切换一次，
-        不注入系统、不参与自动重复。
-        """
-        return self.layer_toggle_hid is not None and hid_code == self.layer_toggle_hid
-
-    def next_layer_name(self, current_name):
-        """按 ``layer_order`` 轮转下一层；未知层名回到默认层，只有一层时返回原名。"""
-        order = tuple(self.layer_order)
-        if not order:
-            return self.default_layer_name
-        try:
-            index = order.index(current_name)
-        except ValueError:
-            return self.default_layer_name
-        return order[(index + 1) % len(order)]
-
-    def get_vk(self, layer_name, hid_code):
-        """按层取虚拟键码，未映射返回 ``None``。默认查 ``layers``。"""
-        layer = self.layers.get(layer_name)
-        if layer is None:
-            return None
-        return layer.get(hid_code)
-
-    @property
-    def consumer_map(self):
-        """消费类 usage → VK 的映射表。默认空表（没有媒体键）。"""
-        return {}
-
-    def get_consumer_vk(self, usage):
-        """消费类 usage → VK，未映射返回 ``None``。默认查 ``consumer_map``。"""
-        return self.consumer_map.get(usage)
-
-    @property
-    def keymap_subsets(self):
-        """构成 ``layers`` 的命名子表（如 C/XL/XN），只供文档与一致性自检使用。
-
-        默认空。若提供，自检要求每个子表至少被某一层完整包含，避免改了子表却
-        忘了重新合并进层表。
-        """
-        return {}
-
-    # ============================================================
-    # 6. 重复策略（可选）
-    # ============================================================
-    @property
-    def no_repeat_vks(self):
-        """不参与自动重复的 VK 集合（如锁定键）。默认空集。"""
-        return frozenset()
-
-    @property
-    def repeat_consumer_vks(self):
-        """参与长按重复的消费类 VK。默认为空（消费类只在按下/抬起各上报一次）。"""
-        return ()
-
-    def repeats_key(self, vk):
-        """普通键/修饰键是否参与自动重复。默认：非空且不在 ``no_repeat_vks``。"""
-        return vk is not None and vk not in self.no_repeat_vks
-
-    def repeats_consumer(self, vk):
-        """消费类键是否参与长按重复。默认：在 ``repeat_consumer_vks`` 内。"""
-        return vk in self.repeat_consumer_vks
-
-    # ============================================================
-    # 7. 指示灯能力（可选）
+    # 5. 指示灯输出报告（可选）
     # ============================================================
     @property
     def led_supported(self):
-        """是否声明指示灯可控。默认 ``False``：默认关闭，只有显式 ``--led`` 才尝试。"""
+        """是否声明指示灯输出报告可写。
+
+        默认 ``False``。声明为 ``True`` 表示主机应当把系统锁定状态
+        （Num/Caps/Scroll）写回设备——这是原生 HID 键盘类驱动的标准行为，
+        有些固件还会据此切换上报的键值（例如 Num Lock 时把字母区改报小键盘）。
+        """
         return False
+
+    @property
+    def led_report_id(self):
+        """LED 输出报告的 Report ID。默认 0（描述符未给 LED 段分配 Report ID）。"""
+        return 0
 
     @property
     def led_report_length(self):
@@ -291,7 +215,7 @@ class KeyboardDevice(ABC):
 
     @property
     def led_poll_interval_s(self):
-        """锁定状态兜底轮询间隔（秒）。默认 0.2，避免无谓的 USB 流量。"""
+        """锁定状态兜底轮询间隔（秒）。默认 0.2；轮询只读系统状态，不变就不写 USB。"""
         return 0.2
 
     @property
@@ -299,12 +223,14 @@ class KeyboardDevice(ABC):
         """``(bit, vk)`` 序列，描述 LED 位序。默认空（不声明位定义）。"""
         return ()
 
-    @property
-    def led_unavailable_hint(self):
-        """指示灯不可用时打印给用户的说明。默认空串。"""
-        return ''
-
     def led_report(self, bitmap):
-        """把 LED 位图打包成 HID 输出报告。默认按 ``led_report_length`` 小端截断。"""
+        """把 LED 位图打包成 HID 输出报告。
+
+        默认按 ``led_report_length`` 小端截断；``led_report_id`` 非 0 时把 Report ID
+        作为首字节前置（HID Set_Report 的两种惯例之一，视设备描述符而定）。
+        """
         mask = (1 << (8 * self.led_report_length)) - 1
-        return int(bitmap & mask).to_bytes(self.led_report_length, 'little')
+        payload = int(bitmap & mask).to_bytes(self.led_report_length, 'little')
+        if self.led_report_id:
+            return bytes([self.led_report_id]) + payload
+        return payload

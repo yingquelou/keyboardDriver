@@ -2,9 +2,10 @@
 """keyboard_utils.py —— 通用键盘接管实现（设备差异全部来自 device_profile）
 
 本文件只做与具体键盘无关的事：枚举设备、按角色识别接口、claim、读取循环、
-按键注入、自动重复引擎、层状态机、指示灯同步、日志。
-VID/PID、接口角色、报告布局、消费类集合、HID→VK 映射、层切换键、重复策略、
-LED 位序等全部通过 device_profile 取值——换键盘时不要改本文件。
+按键注入、自动重复引擎、指示灯同步、日志。
+VID/PID、接口角色、报告布局、消费类集合、指示灯输出报告格式全部通过 device_profile
+取值；usage→VK 换算与重复语义来自通用模块 hid_usage（HID Usage Tables）——换键盘时
+不要改本文件。
 """
 import ctypes
 import time
@@ -18,6 +19,7 @@ except ImportError:                       # 未安装 pywin32 时退回 ctypes �
     import win32_compat as win32api
     win32con = win32api
 import device_profile as profile
+import hid_usage
 
 # ---------- 引擎参数（与设备无关） ----------
 READ_TIMEOUT_MS = 10            # 需要周期性检查自动重复，读超时不能太长
@@ -28,28 +30,12 @@ backend = usb.backend.libusb1.get_backend()
 if backend is None:
     raise RuntimeError("无法加载 libusb 后端")
 
-# ---------- 层管理 ----------
-_current_layer_name = profile.DEFAULT_LAYER_NAME
-
-def get_current_layer_name():
-    return _current_layer_name
-
-def get_current_layer_dict():
-    return profile.LAYERS.get(_current_layer_name, {})
-
-def toggle_layer():
-    """切换到下一层，并返回新层名称（只有一层的设备等价于不切换）"""
-    global _current_layer_name
-    new_name = profile.next_layer_name(_current_layer_name)
-    if new_name == _current_layer_name:
-        return _current_layer_name
-    _current_layer_name = new_name
-    print(f"[层切换] 当前层: {_current_layer_name}")
-    return _current_layer_name
-
+# ---------- usage → VK ----------
+# 通用映射来自 hid_usage（HID Usage Tables），不区分"层"：设备在 Num Lock 灯位为 1 时
+# 自己把字母区改报成小键盘 usage（J: 0x0D → 0x59），两者都能查到对应 VK。
 def get_vk(hid_code):
-    """根据当前层获取虚拟键码，若未映射则返回 None"""
-    return profile.get_vk(_current_layer_name, hid_code)
+    """键盘页 usage → 虚拟键码，未映射返回 None"""
+    return hid_usage.get_vk(hid_code)
 
 # ---------- 反向映射（校准用） ----------
 _VK_NAME_MAP = {value: name for name, value in win32con.__dict__.items() if name.startswith('VK_')}
@@ -418,7 +404,7 @@ def simulate_modifiers(modifier_byte, prev_modifier_byte):
 
 # ---------- 按键状态与自动重复 ----------
 # 记录 hid_code -> 实际注入的虚拟键码。抬起时使用按下时的映射，
-# 避免按住某键期间切换层后，抬起用的是新层的键码（原生行为不会出现“错键/残留键”）。
+# 因此中途锁定状态变化（固件切层）不会让抬起错用另一个键码，不会残留按键。
 _active_keys = {}
 _key_down_time = {}   # hid_code -> 按下时刻（用于自动重复）
 _repeat_next = {}     # hid_code -> 下一次重复时刻
@@ -433,7 +419,7 @@ _repeat_mod_next = {}     # vk -> 下一次重复时刻
 
 # 注入的按键不会触发系统自动重复（原生 HID 键盘的重复由键盘类驱动产生），
 # 这里按系统设置的延迟/速率补发 keydown。
-# 哪些键不参与重复（例如锁定键）由 device_profile.repeats_key 决定。
+# 哪些键不参与重复（例如锁定键）由 hid_usage.repeats_key 决定。
 
 _repeat_timing = None
 _repeat_timing_at = 0
@@ -530,28 +516,17 @@ def release_all_keys():
     _consumer_repeat_next = None
 
 def simulate_keys(current_keys, prev_keys):
-    """处理按键变化。
+    """处理按键变化：按下注入、松开抬起。
 
-    层切换键由 device_profile.is_layer_toggle 判定：只在“上一份报告未按下、
-    本报告按下”的边沿切换一次，本身不注入任何按键。
+    这里没有任何"层"的概念：设备上报什么 usage，就按 HID Usage Tables 换成 VK。
+    Num Lock 的切层由固件完成（它按主机回写的灯位决定上报字母区还是小键盘 usage）。
     """
     global _repeat_hid, _repeat_mod
-    # ---- 检测层切换键按下：只看边沿，按住期间不重复切换 ----
-    # 不能用排除该键的 prev_keys 做比较，否则按住层切换键期间每出现一个新键都会再次切换。
-    current_toggle = any(profile.is_layer_toggle(k) for k in current_keys)
-    previous_toggle = any(profile.is_layer_toggle(k) for k in prev_keys)
-    if current_toggle and not previous_toggle:
-        toggle_layer()
-        # 注意：不模拟任何按键，层切换键本身不产生任何输入
-
-    # ---- 处理其他所有按键（排除层切换键） ----
-    other_current = [k for k in current_keys if not profile.is_layer_toggle(k)]
-
     now = time.monotonic()
 
-    # 释放已松开的键：使用按下时记录的虚拟键码（而非当前层映射）
+    # 释放已松开的键：使用按下时记录的虚拟键码
     for hid_code in list(_active_keys.keys()):
-        if hid_code not in other_current:
+        if hid_code not in current_keys:
             simulate_key(_active_keys.pop(hid_code), down=False)
             _key_down_time.pop(hid_code, None)
             _repeat_next.pop(hid_code, None)
@@ -560,7 +535,7 @@ def simulate_keys(current_keys, prev_keys):
                 _repeat_hid = None
 
     # 按下新按下的键
-    for hid_code in other_current:
+    for hid_code in current_keys:
         if hid_code in _active_keys:
             continue
         # 任何新按下的键都会接管自动重复，原目标立即停止
@@ -573,15 +548,14 @@ def simulate_keys(current_keys, prev_keys):
         _active_keys[hid_code] = vk
         _key_down_time[hid_code] = now
         _repeat_next.pop(hid_code, None)
-        if profile.repeats_key(vk):
+        if hid_usage.repeats_key(vk):
             _repeat_hid = hid_code
 
-    # 更新 prev_keys：保留层切换键的真实状态，供下一份报告的边沿检测使用
     prev_keys[:] = list(current_keys)
 
 # ---------- 消费类按键 ----------
 # 消费类端点只在按下、抬起各上报一次，按住不会重发，因此长按重复由主机侧定时补发；
-# 哪些消费类键参与重复由 device_profile.repeats_consumer 决定。
+# 哪些消费类键参与重复由 hid_usage.repeats_consumer 决定。
 _consumer_usage = 0
 _consumer_vk = None
 _consumer_repeat_vk = None     # 当前参与重复的消费类 VK（其它媒体键为 None）
@@ -603,12 +577,12 @@ def simulate_consumer_usage(usage):
     _consumer_repeat_next = None
     _consumer_usage = usage
     if usage:
-        vk = profile.get_consumer_vk(usage)
+        vk = hid_usage.get_consumer_vk(usage)
         if vk is not None:
             simulate_key(vk, down=True)
             _consumer_vk = vk
-            # 只有设备声明的“可重复”消费键参与长按（本键盘为音量键）
-            if profile.repeats_consumer(vk):
+            # 只有 hid_usage 声明的“可重复”消费键参与长按（音量键）
+            if hid_usage.repeats_consumer(vk):
                 _consumer_repeat_vk = vk
                 _consumer_repeat_start = time.monotonic()
 
@@ -623,8 +597,13 @@ def read_lock_bitmap():
     return bitmap
 
 def write_led_bitmap(dev, bitmap, timeout=100):
-    """把 LED 位图写入键盘接口的输出报告（HID Set_Report）"""
-    dev.ctrl_transfer(0x21, 0x09, 0x0200, 0, profile.led_report(bitmap), timeout=timeout)
+    """把 LED 位图写入键盘接口的输出报告（HID Set_Report）
+
+    wValue = (0x02 << 8) | Report ID，wIndex = 接口号（键盘接口为 0）。
+    报告长度与 Report ID 都由 device_profile 按描述符给出，不做任何猜测。
+    """
+    dev.ctrl_transfer(0x21, 0x09, 0x0200 | profile.LED_REPORT_ID, 0,
+                      profile.led_report(bitmap), timeout=timeout)
 
 # ---------- 导出 ----------
 __all__ = [
@@ -633,6 +612,5 @@ __all__ = [
     'simulate_key', 'simulate_modifiers', 'simulate_keys', 'simulate_consumer_usage',
     'update_key_repeats', 'release_all_keys',
     'read_lock_bitmap', 'write_led_bitmap',
-    'get_vk_name', 'get_device_product', 'get_current_layer_name',
-    'toggle_layer', 'get_vk'
+    'get_vk_name', 'get_device_product', 'get_vk',
 ]

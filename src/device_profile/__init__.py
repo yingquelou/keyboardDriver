@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 """device_profile —— 键盘设备描述包（当前设备：1EA7:0066 无线键盘）
 
-本项目**唯一**允许出现"该键盘专有常量/分支"的地方：VID/PID、接口角色、报告布局、
-消费类集合、HID→VK 映射表、层切换键与策略、自动重复策略、指示灯能力。
+本项目**唯一**允许出现"该键盘专有事实"的地方，而且只记录**报告布局类事实**：
+VID/PID、接口角色、键盘/消费类报告布局、指示灯输出报告格式。
 
-通用实现（keyboard.py / keyboard_utils.py / tools）只通过 ``device_profile.X``
-或 ``from device_profile import X`` 取值，不再内嵌任何本键盘的专有常量。
+usage→VK 换算和自动重复语义不在这里，放在通用模块 ``src/hid_usage.py``：
+设备固件自己按 Num Lock 灯位切换上报的 usage，主机只扮演通用 HID 键盘类驱动。
 
 包内按职责拆分（换键盘时**只改这个包**，文件名/导出名保持不变）：
 
     contract.py   设备契约：KeyboardDevice 基类，规定"一把键盘要提供什么"
-                  （七组：身份、接口角色、键盘报告、消费类报告、键表与层、
-                  重复策略、指示灯能力；仅必需项为 abstract）
-    device.py     当前键盘对契约的实现（只做装配，委托下面四个模块）
+                  （五组：身份、接口角色、键盘报告、消费类报告、指示灯输出报告；
+                  仅必需项为 abstract）
+    device.py     当前键盘对契约的实现（只做装配，委托下面两个模块）
     identity.py   身份与接口角色：VID/PID、接口判定、端点预期   ← 换 VID/PID 改这里
-    reports.py    报告解析：键盘报告布局、消费类 Report ID 与 usage、读取长度
-    keys.py       键表与层：C/XL/XN/CONSUMER 映射表、层切换键与切层策略
-                  （体量大、变动频繁，改键位映射主要改这一个文件）
-    policy.py     策略：自动重复规则、指示灯能力
+    reports.py    报告布局：键盘报告、消费类 Report ID 与 usage、指示灯输出报告
     _win32.py     win32 常量入口与 VK 补全（私有，不对外）
 
 本模块只做"实例化一份 + 导出"，不含实现：``PROFILE`` 是当前设备的唯一实例
@@ -68,40 +65,15 @@ choose_consumer_report = PROFILE.choose_consumer_report
 consumer_report_read_size = PROFILE.consumer_report_read_size
 parse_consumer_report = PROFILE.parse_consumer_report
 
-# ---------- 5. 键表与层 ----------
-LAYERS = PROFILE.layers
-LAYER_ORDER = PROFILE.layer_order
-DEFAULT_LAYER_NAME = PROFILE.default_layer_name
-LAYER_TOGGLE_HID = PROFILE.layer_toggle_hid
-CONSUMER = PROFILE.consumer_map
-is_layer_toggle = PROFILE.is_layer_toggle
-next_layer_name = PROFILE.next_layer_name
-get_vk = PROFILE.get_vk
-get_consumer_vk = PROFILE.get_consumer_vk
-
-# C / XL / XN 是维护用的三个键表子集（历史导出名）。契约只要求 keymap_subsets
-# 中的子表能被层表覆盖，未提供子表的设备这里退化为空表。
-_keymap_subsets = PROFILE.keymap_subsets
-C = _keymap_subsets.get('C', {})
-XL = _keymap_subsets.get('XL', {})
-XN = _keymap_subsets.get('XN', {})
-del _keymap_subsets
-
-# ---------- 6. 重复策略 ----------
-NO_REPEAT_VKS = PROFILE.no_repeat_vks
-CONSUMER_REPEAT_VKS = PROFILE.repeat_consumer_vks
-repeats_key = PROFILE.repeats_key
-repeats_consumer = PROFILE.repeats_consumer
-
-# ---------- 7. 指示灯能力 ----------
+# ---------- 5. 指示灯输出报告 ----------
 LED_SUPPORTED = PROFILE.led_supported
+LED_REPORT_ID = PROFILE.led_report_id
 LED_REPORT_LENGTH = PROFILE.led_report_length
 LED_POLL_INTERVAL_S = PROFILE.led_poll_interval_s
 LED_BITS = PROFILE.led_bits
-LED_UNAVAILABLE_HINT = PROFILE.led_unavailable_hint
 led_report = PROFILE.led_report
 
-# 公共符号清单：与拆分前的单文件模块保持一致（当日志/诊断代码用 import * 时行为不变）。
+# 公共符号清单（当日志/诊断代码用 import * 时行为不变）。
 # win32con 也在其中，因为旧单文件版本会把导入的 win32con 一并暴露。
 __all__ = [
     'win32con',
@@ -116,10 +88,6 @@ __all__ = [
     'CONSUMER_REPORT_ID', 'CONSUMER_REPORT_ID_SIZE',
     'CONSUMER_USAGE_SIZE', 'CONSUMER_USAGE_BITS', 'CONSUMER_USAGE_BYTE_ORDER',
     'choose_consumer_report', 'consumer_report_read_size', 'parse_consumer_report',
-    'LAYER_TOGGLE_HID', 'LAYER_ORDER', 'DEFAULT_LAYER_NAME',
-    'is_layer_toggle', 'next_layer_name', 'get_vk',
-    'C', 'XL', 'XN', 'LAYERS', 'CONSUMER', 'get_consumer_vk',
-    'NO_REPEAT_VKS', 'CONSUMER_REPEAT_VKS', 'repeats_key', 'repeats_consumer',
-    'LED_SUPPORTED', 'LED_REPORT_LENGTH', 'LED_POLL_INTERVAL_S',
-    'LED_BITS', 'LED_UNAVAILABLE_HINT', 'led_report',
+    'LED_SUPPORTED', 'LED_REPORT_ID', 'LED_REPORT_LENGTH', 'LED_POLL_INTERVAL_S',
+    'LED_BITS', 'led_report',
 ]

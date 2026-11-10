@@ -224,7 +224,7 @@ schtasks /Delete /TN KeyboardDriver /F
 | `Access denied` / 访问被拒 | 已有另一个实例占用接口：先结束旧进程；或确认任务以最高权限运行 |
 | 媒体键无效 | 先用 `tools\probe_keyboard.py` 看是否识别到消费类接口（端点 0x82、Report ID 1） |
 | 登录后没启动 | `schtasks /Query /TN KeyboardDriver /V /FO LIST` 看状态；看 `logs\keyboard.log` |
-| 指示灯不亮 | WinUSB 接管后本设备指示灯不可控，属已知限制，不是故障 |
+| 指示灯不亮 | 确认启动日志里没有 `指示灯同步被 --no-led 关闭`（灯位回写默认开启，且是 Num Lock 切层的必要条件）；可用 `tools\native_probe.py led` 单独验证按 1 字节 Output 报告回写 |
 
 ## 7. 验证状态（如实标注）
 

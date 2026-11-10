@@ -16,7 +16,7 @@ from keyboard_utils import (
     simulate_modifiers, simulate_keys, simulate_key,
     simulate_consumer_usage, update_key_repeats, release_all_keys,
     has_active_keys, read_lock_bitmap, write_led_bitmap,
-    get_device_product, get_current_layer_name
+    get_device_product
 )
 
 # USB 读取超时（毫秒）：没有按键按下时用较长超时，让读操作阻塞等待、显著降低空转 CPU；
@@ -50,7 +50,9 @@ def consumer_loop(dev, ep, stop_event):
 
 # ---------- 指示灯线程 ----------
 # 位图完全由系统真实锁定状态计算，不维护影子状态：
-#   启动先同步一次，之后按 device_profile.LED_POLL_INTERVAL_S 兜底轮询，锁定状态一变就立即写。
+#   启动先同步一次，之后按 device_profile.LED_POLL_INTERVAL_S 轮询，锁定状态一变就立即写。
+# 这不只是"亮灯"：本设备按 Num Lock 灯位决定上报字母区还是小键盘 usage，
+# 因此灯位回写是切层的必要一环（与原生 HID 键盘类的行为一致）。
 # 写失败按 5 秒限流告警并在下一轮重试；任何异常都不会影响按键主循环。
 def led_loop(dev, stop_event):
     last_bitmap = None
@@ -90,18 +92,16 @@ def process_loop(dev, ep, enable_led=False):
         print("[提示] 未找到可读的消费类接口，媒体键/音量键不可用。")
 
     # 指示灯同步线程：默认值由设备模块声明（LED_SUPPORTED）。
-    # 本设备在 WinUSB 接管模式下写灯返回成功但灯无反应，因此默认关闭；
-    # 只有显式 --led 才启用，避免无意义的小流量与日志噪音。
+    # 本设备的切层依赖主机回写 Num Lock 灯位，所以默认必须启用；--no-led 只用于排障。
     led_thread = None
     if enable_led:
         led_thread = threading.Thread(target=led_loop, args=(dev, stop_event), daemon=True)
         led_thread.start()
-        print("[信息] 指示灯同步已启用（--led）")
+        print("[信息] 指示灯同步已启用（锁定状态会回写设备，切层依赖它）")
     else:
-        reason = profile.LED_UNAVAILABLE_HINT if not profile.LED_SUPPORTED else "设备默认关闭"
-        print(f"[信息] 指示灯同步未启用（{reason}，如需尝试请加 --led）")
+        print("[警告] 指示灯同步被 --no-led 关闭：Num Lock 切层不会生效")
 
-    print(f"开始监听键盘，当前层: {get_current_layer_name()}，按 Ctrl+C 退出。")
+    print("开始监听键盘，按 Ctrl+C 退出。")
     try:
         while True:
             timeout = ACTIVE_READ_TIMEOUT_MS if has_active_keys() else IDLE_READ_TIMEOUT_MS
@@ -112,7 +112,7 @@ def process_loop(dev, ep, enable_led=False):
                 if modifier != prev_modifier:
                     simulate_modifiers(modifier, prev_modifier)
                     prev_modifier = modifier
-                # 处理普通键变化（包含层切换逻辑）
+                # 处理普通键变化（含锁定键：按 usage 通用映射转发，见 hid_usage）
                 if keys != prev_keys:
                     simulate_keys(keys, prev_keys)
                     # 注意：simulate_keys 会修改 prev_keys，因此这里不需要再赋值
