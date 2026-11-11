@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""keyboard_utils.py —— 通用键盘接管实现（设备差异全部来自 device_profile）
+"""transport.py —— 主机侧 HID 键盘类驱动的原语层（设备差异全部来自 device_profile）
 
-本文件只做与具体键盘无关的事：枚举设备、按角色识别接口、claim、读取循环、
-按键注入、自动重复引擎、指示灯同步、日志。
+本文件只提供"对真机做一次操作"的原语：枚举设备、按描述符角色识别接口并 claim、
+单次读取与解析、注入一次按键，以及围绕注入的状态机（按下表、自动重复、指示灯位图）。
+线程与重连在 driver.py，入口在 __main__.py，计划任务/日志在 run.py，这里不碰进程生命周期。
+
 VID/PID、接口角色、报告布局、消费类集合、指示灯输出报告格式全部通过 device_profile
-取值；usage→VK 换算与重复语义来自通用模块 hid_usage（HID Usage Tables）——换键盘时
+取值；usage→VK 换算与重复语义来自通用模块 usage（HID Usage Tables）——换键盘时
 不要改本文件。
 """
 import ctypes
@@ -16,10 +18,10 @@ try:
     import win32api
     import win32con
 except ImportError:                       # 未安装 pywin32 时退回 ctypes 兼容层
-    import win32_compat as win32api
+    from . import win32_compat as win32api
     win32con = win32api
-import device_profile as profile
-import hid_usage
+from . import device_profile as profile
+from . import usage
 
 # ---------- 引擎参数（与设备无关） ----------
 READ_TIMEOUT_MS = 10            # 需要周期性检查自动重复，读超时不能太长
@@ -30,23 +32,7 @@ backend = usb.backend.libusb1.get_backend()
 if backend is None:
     raise RuntimeError("无法加载 libusb 后端")
 
-# ---------- usage → VK ----------
-# 通用映射来自 hid_usage（HID Usage Tables），不区分"层"：设备在 Num Lock 灯位为 1 时
-# 自己把字母区改报成小键盘 usage（J: 0x0D → 0x59），两者都能查到对应 VK。
-def get_vk(hid_code):
-    """键盘页 usage → 虚拟键码，未映射返回 None"""
-    return hid_usage.get_vk(hid_code)
-
-# ---------- 反向映射（校准用） ----------
-_VK_NAME_MAP = {value: name for name, value in win32con.__dict__.items() if name.startswith('VK_')}
-
-def get_vk_name(vk_value):
-    """将虚拟键码转换为友好名称（用于校准）"""
-    if 0x30 <= vk_value <= 0x39 or 0x41 <= vk_value <= 0x5A:
-        return chr(vk_value)
-    if 0x61 <= vk_value <= 0x7A:
-        return chr(vk_value - 0x20)
-    return _VK_NAME_MAP.get(vk_value, f"0x{vk_value:02X}")
+# usage→VK 映射归 usage：本模块直接调用，不再转手导出一份（避免两个入口各自演化）。
 
 def get_device_product(dev):
     """安全获取设备产品名称"""
@@ -284,7 +270,8 @@ def find_device():
     return fallback or devs[0]
 
 def configure_device(dev):
-    """配置设备并返回键盘数据端点"""
+    """配置设备并返回键盘数据端点；同时记下键盘接口号供灯位回写使用"""
+    global _keyboard_interface_number
     try:
         dev.set_configuration()
     except usb.core.USBError as e:
@@ -296,6 +283,7 @@ def configure_device(dev):
     ep_in = _find_data_endpoint(_iter_endpoints(intf))
     if ep_in is None:
         raise ValueError("未找到中断输入端点")
+    _keyboard_interface_number = intf.bInterfaceNumber
     return ep_in
 
 def find_consumer_endpoint(verbose=False, dev=None):
@@ -393,6 +381,7 @@ def simulate_modifiers(modifier_byte, prev_modifier_byte):
             simulate_key(vk, down=True)
             _modifier_down[vk] = time.monotonic()
             # 最近按下的键接管自动重复，先前的字符键/修饰键都停止重复
+            # （原生对照见上方 _repeat_hid：按住 J 时点 Shift，J 的重复即停止且不恢复）
             _repeat_mod = vk
             _repeat_hid = None
         elif not current and previous:
@@ -410,6 +399,13 @@ _key_down_time = {}   # hid_code -> 按下时刻（用于自动重复）
 _repeat_next = {}     # hid_code -> 下一次重复时刻
 # 原生键盘的自动重复只针对“最近按下的那个键”（含修饰键）：按住 A 再按 B，A 停止重复；
 # 松开 B 也不会让 A 恢复重复。这里用单独变量记录当前重复对象。
+#
+# 这不是推测，已做原生对照（2026-11-10，Win11，记事本）：
+#   参照 = 笔记本内置键盘（原生 HidUsb）；被测 = 本实现（外置键盘 + 驱动）。
+#   手势 1：按住 J → 点一下 K → 继续按住 J；手势 2：按住 J → 点一下 Shift → 继续按住 J。
+#   两个手势各 3 次，两段结论全部为“松开打断键后完全停止”，Shift 期间也不出现大写 J。
+#   所以“新键抢占后不归还”就是原生语义，不要改成松开后恢复上一个键。
+#   注：手势 1 有一条“抖动”记录落在录入有误的那一次里，不作为结论引用。
 _repeat_hid = None
 
 # 修饰键不占键码槽，单独记录：原生同样会对按住的修饰键产生自动重复
@@ -419,7 +415,7 @@ _repeat_mod_next = {}     # vk -> 下一次重复时刻
 
 # 注入的按键不会触发系统自动重复（原生 HID 键盘的重复由键盘类驱动产生），
 # 这里按系统设置的延迟/速率补发 keydown。
-# 哪些键不参与重复（例如锁定键）由 hid_usage.repeats_key 决定。
+# 哪些键不参与重复（例如锁定键）由 usage.repeats_key 决定。
 
 _repeat_timing = None
 _repeat_timing_at = 0
@@ -498,8 +494,8 @@ def has_active_keys():
     return bool(_active_keys) or bool(_modifier_down) or _consumer_repeat_vk is not None
 
 def release_all_keys():
-    """释放所有当前按下的键（使用按下时记录的虚拟键码）"""
-    global _repeat_hid, _repeat_mod, _consumer_repeat_vk, _consumer_repeat_next
+    """释放所有当前按下的键（普通键、修饰键、消费类），并停止所有自动重复"""
+    global _repeat_hid, _repeat_mod
     for vk in list(_active_keys.values()):
         simulate_key(vk, down=False)
     for vk in list(_modifier_down.keys()):
@@ -511,9 +507,9 @@ def release_all_keys():
     _repeat_mod_next.clear()
     _repeat_hid = None
     _repeat_mod = None
-    # 断线/退出时同步停掉音量键重复，避免定时器继续补发
-    _consumer_repeat_vk = None
-    _consumer_repeat_next = None
+    # 消费类按键也在这里收尾：只清重复状态而不清 _consumer_usage，
+    # 会让重连后同一个 usage 被当成"没变化"而漏注入。
+    simulate_consumer_usage(0)
 
 def simulate_keys(current_keys, prev_keys):
     """处理按键变化：按下注入、松开抬起。
@@ -531,7 +527,7 @@ def simulate_keys(current_keys, prev_keys):
             _key_down_time.pop(hid_code, None)
             _repeat_next.pop(hid_code, None)
             if hid_code == _repeat_hid:
-                # 松开重复键后不再转移到其它仍按住的键（原生行为）
+                # 松开重复键后不再转移到其它仍按住的键（原生行为，对照记录见 _repeat_hid）
                 _repeat_hid = None
 
     # 按下新按下的键
@@ -541,32 +537,32 @@ def simulate_keys(current_keys, prev_keys):
         # 任何新按下的键都会接管自动重复，原目标立即停止
         _repeat_hid = None
         _repeat_mod = None
-        vk = get_vk(hid_code)
+        vk = usage.get_vk(hid_code)
         if vk is None:
             continue
         simulate_key(vk, down=True)
         _active_keys[hid_code] = vk
         _key_down_time[hid_code] = now
         _repeat_next.pop(hid_code, None)
-        if hid_usage.repeats_key(vk):
+        if usage.repeats_key(vk):
             _repeat_hid = hid_code
 
     prev_keys[:] = list(current_keys)
 
 # ---------- 消费类按键 ----------
 # 消费类端点只在按下、抬起各上报一次，按住不会重发，因此长按重复由主机侧定时补发；
-# 哪些消费类键参与重复由 hid_usage.repeats_consumer 决定。
+# 哪些消费类键参与重复由 usage.repeats_consumer 决定。
 _consumer_usage = 0
 _consumer_vk = None
 _consumer_repeat_vk = None     # 当前参与重复的消费类 VK（其它媒体键为 None）
 _consumer_repeat_start = 0.0
 _consumer_repeat_next = None
 
-def simulate_consumer_usage(usage):
+def simulate_consumer_usage(usage_code):
     """把消费类 usage 注入为对应虚拟键；usage 变为 0 时抬起并停止重复"""
     global _consumer_usage, _consumer_vk
     global _consumer_repeat_vk, _consumer_repeat_start, _consumer_repeat_next
-    if usage == _consumer_usage:
+    if usage_code == _consumer_usage:
         # 设备不重发报告，重复由 update_key_repeats 按系统节奏补发；
         # 这里直接忽略重复报告，避免与定时补发叠加成双倍速率
         return
@@ -575,18 +571,23 @@ def simulate_consumer_usage(usage):
         _consumer_vk = None
     _consumer_repeat_vk = None
     _consumer_repeat_next = None
-    _consumer_usage = usage
-    if usage:
-        vk = hid_usage.get_consumer_vk(usage)
+    _consumer_usage = usage_code
+    if usage_code:
+        vk = usage.get_consumer_vk(usage_code)
         if vk is not None:
             simulate_key(vk, down=True)
             _consumer_vk = vk
-            # 只有 hid_usage 声明的“可重复”消费键参与长按（音量键）
-            if hid_usage.repeats_consumer(vk):
+            # 只有 usage 模块声明的“可重复”消费键参与长按（音量键）
+            if usage.repeats_consumer(vk):
                 _consumer_repeat_vk = vk
                 _consumer_repeat_start = time.monotonic()
 
 # ---------- 指示灯同步 ----------
+# 键盘接口号：由 configure_device 按描述符角色解析后记录，灯位回写用它当 wIndex。
+# 不写死 0——接口号是枚举结果，整设备接管与按接口接管两种形态下都可能不同。
+_keyboard_interface_number = 0
+
+
 def read_lock_bitmap():
     """按系统真实锁定状态计算 LED 位图（位定义由 device_profile.LED_BITS 提供）"""
     user32 = ctypes.windll.user32
@@ -599,10 +600,11 @@ def read_lock_bitmap():
 def write_led_bitmap(dev, bitmap, timeout=100):
     """把 LED 位图写入键盘接口的输出报告（HID Set_Report）
 
-    wValue = (0x02 << 8) | Report ID，wIndex = 接口号（键盘接口为 0）。
+    wValue = (0x02 << 8) | Report ID，wIndex = 键盘接口号（由 configure_device 解析）。
     报告长度与 Report ID 都由 device_profile 按描述符给出，不做任何猜测。
     """
-    dev.ctrl_transfer(0x21, 0x09, 0x0200 | profile.LED_REPORT_ID, 0,
+    dev.ctrl_transfer(0x21, 0x09, 0x0200 | profile.LED_REPORT_ID,
+                      _keyboard_interface_number,
                       profile.led_report(bitmap), timeout=timeout)
 
 # ---------- 导出 ----------
@@ -610,7 +612,7 @@ __all__ = [
     'find_device', 'configure_device', 'read_report', 'find_consumer_endpoint',
     'read_consumer_report', 'parse_keyboard_report', 'parse_consumer_report',
     'simulate_key', 'simulate_modifiers', 'simulate_keys', 'simulate_consumer_usage',
-    'update_key_repeats', 'release_all_keys',
+    'update_key_repeats', 'release_all_keys', 'has_active_keys',
     'read_lock_bitmap', 'write_led_bitmap',
-    'get_vk_name', 'get_device_product', 'get_vk',
+    'get_device_product',
 ]

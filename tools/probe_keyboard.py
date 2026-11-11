@@ -1,16 +1,26 @@
 # -*- coding: utf-8 -*-
-"""probe_keyboard.py —— USB 无线键盘真机诊断脚本（设备身份取自 device_profile 包）
+"""probe_keyboard.py —— HID 集合层诊断（设备身份取自 device_profile 包）
 
-独立脚本：只依赖 Python 标准库、ctypes（setupapi / hid.dll / user32 / kernel32）
-与本仓库的 src\\device_profile\\identity.py（仅取 VID/PID），不使用 pyusb，不需要 Zadig，
+只回答一个问题：这台机器上的 HID 接口各自暴露了哪些集合、端点、包长与 Report ID，
+以及当前进程能不能以读权限打开它们。不做设备/驱动绑定判读（那是
+``enum_usb_nodes.py``），不做按键语义判定（那是 ``calibrate``）。
+
+独立脚本：只依赖 Python 标准库、ctypes（setupapi / hid.dll / kernel32）
+与本仓库的 keyboard_driver\\device_profile\\identity.py（仅取 VID/PID），不使用 pyusb，不需要 Zadig，
 不替换系统驱动，也不会独占键盘。
 
 用法（建议在目标机上以管理员身份打开命令提示符）：
     python probe_keyboard.py            # 默认：只处理 VID/PID 匹配的集合 + 抓包
     python probe_keyboard.py --enum     # 只枚举与自检，不抓包
-    python probe_keyboard.py --all      # 全量诊断：列出系统所有 HID 集合与键盘/鼠标设备
-                                        # （不按 VID/PID 过滤，不抓包）
+    python probe_keyboard.py --all      # 全量诊断：列出系统所有 HID 集合（不按 VID/PID 过滤）
 退出抓包：在控制台按 q，或按 Ctrl+C。
+
+边界：
+    * 设备节点与驱动绑定（WinUSB/HidUsb/usbccgp、问题码、Zadig 条数）
+      → ``enum_usb_nodes.py``（``--classes`` 保留原来的键盘/鼠标/HID 类列表）。
+    * 键盘集合被系统驱动独占、读不到原始报告时，本脚本不再装键盘钩子；
+      要看系统最终收到的按键，用 ``compare_native.py record``。
+    * WinUSB 绑定下的描述符原文与 LED 实验 → ``native_probe.py``。
 """
 
 import ctypes
@@ -24,9 +34,9 @@ import threading
 import traceback
 from ctypes import wintypes
 
-# 本文件位于 tools/：从 src/device_profile 包读取设备身份，避免在诊断脚本里重复硬编码
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from device_profile import VID, PID, NAME as DEVICE_NAME
+# 本文件位于 tools/：从 keyboard_driver/device_profile 包读取设备身份，避免在诊断脚本里重复硬编码
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from keyboard_driver.device_profile import VID, PID, NAME as DEVICE_NAME
 
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ_WRITE = 0x00000003
@@ -35,29 +45,14 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 DIGCF_PRESENT = 0x02
 DIGCF_DEVICEINTERFACE = 0x10
-DIGCF_ALLCLASSES = 0x04
 
 HIDP_STATUS_SUCCESS = 0x00110000
 HIDP_INPUT = 0
 HIDP_OUTPUT = 1
 
-WH_KEYBOARD_LL = 13
-PM_REMOVE = 0x0001
-
-SPDRP_DEVICEDESC = 0x00
-SPDRP_HARDWAREID = 0x01
-SPDRP_COMPATIBLEIDS = 0x02
-SPDRP_SERVICE = 0x04
-SPDRP_CLASS = 0x07
-SPDRP_CLASSGUID = 0x08
-SPDRP_DRIVER = 0x09
-SPDRP_FRIENDLYNAME = 0x0C
-
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-user32 = ctypes.WinDLL('user32', use_last_error=True)
 setupapi = ctypes.WinDLL('setupapi', use_last_error=True)
 hid = ctypes.WinDLL('hid', use_last_error=True)
-cfgmgr32 = ctypes.WinDLL('cfgmgr32', use_last_error=True)
 
 
 # ---------------- 结构体定义 ----------------
@@ -72,29 +67,11 @@ GUID_DEVINTERFACE_HID = GUID(
     0x4D1E55B2, 0xF16F, 0x11CF,
     (ctypes.c_ubyte * 8)(0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30))
 
-# 设备安装类 GUID：HID / 键盘 / 鼠标
-GUID_DEVCLASS_HID = GUID(
-    0x745A17A0, 0x74D3, 0x11D0,
-    (ctypes.c_ubyte * 8)(0xB6, 0xFE, 0x00, 0xA0, 0xC9, 0x0F, 0x57, 0xDA))
-GUID_DEVCLASS_KEYBOARD = GUID(
-    0x4D36E96B, 0xE325, 0x11CE,
-    (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
-GUID_DEVCLASS_MOUSE = GUID(
-    0x4D36E96F, 0xE325, 0x11CE,
-    (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
-
 
 class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD),
                 ("InterfaceClassGuid", GUID),
                 ("Flags", wintypes.DWORD),
-                ("Reserved", ctypes.c_void_p)]
-
-
-class SP_DEVINFO_DATA(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD),
-                ("ClassGuid", GUID),
-                ("DevInst", wintypes.DWORD),
                 ("Reserved", ctypes.c_void_p)]
 
 
@@ -151,31 +128,6 @@ class HIDP_BUTTON_CAPS(ctypes.Structure):
                 ("DataIndexMax", ctypes.c_ushort)]
 
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-
-
-class MSG(ctypes.Structure):
-    _fields_ = [("hwnd", wintypes.HWND),
-                ("message", wintypes.UINT),
-                ("wParam", wintypes.WPARAM),
-                ("lParam", wintypes.LPARAM),
-                ("time", wintypes.DWORD),
-                ("pt", POINT),
-                ("lPrivate", wintypes.DWORD)]
-
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", wintypes.DWORD),
-                ("scanCode", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.c_void_p)]
-
-
-HOOKPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-
-
 # ---------------- 原型声明 ----------------
 kernel32.CreateFileW.restype = wintypes.HANDLE
 kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD, wintypes.DWORD,
@@ -183,15 +135,6 @@ kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD, wintypes.DWOR
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-
-user32.SetWindowsHookExW.restype = wintypes.HANDLE
-user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HMODULE, wintypes.DWORD]
-user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
-user32.CallNextHookEx.restype = wintypes.LPARAM
-user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
-user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT,
-                                wintypes.UINT, wintypes.UINT]
 
 setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
 setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), ctypes.c_wchar_p,
@@ -206,20 +149,6 @@ setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [wintypes.HANDLE,
                                                       ctypes.POINTER(wintypes.DWORD),
                                                       ctypes.c_void_p]
 setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
-setupapi.SetupDiEnumDeviceInfo.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                           ctypes.POINTER(SP_DEVINFO_DATA)]
-setupapi.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
-setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [wintypes.HANDLE,
-                                                 ctypes.POINTER(SP_DEVINFO_DATA),
-                                                 ctypes.c_wchar_p, wintypes.DWORD,
-                                                 ctypes.POINTER(wintypes.DWORD)]
-setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
-setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [wintypes.HANDLE,
-                                                       ctypes.POINTER(SP_DEVINFO_DATA),
-                                                       wintypes.DWORD,
-                                                       ctypes.POINTER(wintypes.DWORD),
-                                                       ctypes.c_void_p, wintypes.DWORD,
-                                                       ctypes.POINTER(wintypes.DWORD)]
 
 hid.HidD_GetAttributes.restype = wintypes.BOOL
 hid.HidD_GetAttributes.argtypes = [wintypes.HANDLE, ctypes.POINTER(HIDD_ATTRIBUTES)]
@@ -233,11 +162,6 @@ hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
 hid.HidP_GetButtonCaps.restype = ctypes.c_long
 hid.HidP_GetButtonCaps.argtypes = [ctypes.c_int, ctypes.POINTER(HIDP_BUTTON_CAPS),
                                    ctypes.POINTER(ctypes.c_ushort), ctypes.c_void_p]
-
-cfgmgr32.CM_Get_DevNode_Status.restype = ctypes.c_ulong
-cfgmgr32.CM_Get_DevNode_Status.argtypes = [ctypes.POINTER(wintypes.DWORD),
-                                           ctypes.POINTER(wintypes.DWORD),
-                                           wintypes.DWORD, wintypes.DWORD]
 
 
 # ---------------- 工具函数 ----------------
@@ -490,112 +414,6 @@ def _has_report_id(info):
     return False
 
 
-# ---------------- SetupAPI 设备视角（判断系统把它枚举成了什么） ----------------
-_PROBLEM_TEXT = {
-    0: '正常',
-    1: '未配置',
-    3: '驱动未加载',
-    10: '启动失败',
-    12: '资源冲突',
-    14: '需要重启',
-    18: '需要重新安装',
-    19: '注册表错误',
-    21: '系统将删除',
-    22: '已禁用',
-    23: '驱动加载中',
-    24: '设备不存在',
-    28: '驱动安装失败',
-    31: '无法加载驱动',
-    43: '已被禁用',
-}
-
-
-def get_device_instance_id(devs, did):
-    buf = ctypes.create_unicode_buffer(512)
-    need = wintypes.DWORD(0)
-    if setupapi.SetupDiGetDeviceInstanceIdW(devs, ctypes.byref(did), buf, 512,
-                                            ctypes.byref(need)):
-        return buf.value
-    return None
-
-
-def get_reg_prop(devs, did, prop):
-    buf = ctypes.create_string_buffer(2048)
-    need = wintypes.DWORD(0)
-    typ = wintypes.DWORD(0)
-    if not setupapi.SetupDiGetDeviceRegistryPropertyW(devs, ctypes.byref(did), prop,
-                                                      ctypes.byref(typ), buf, 2048,
-                                                      ctypes.byref(need)):
-        return None
-    data = bytes(bytearray(buf[:need.value]))
-    if typ.value == 7:      # REG_MULTI_SZ
-        parts = [p for p in data.decode('utf-16-le', 'ignore').split('\x00') if p]
-        return ' | '.join(parts[:3])
-    return data.decode('utf-16-le', 'ignore').split('\x00')[0]
-
-
-def get_status(devinst):
-    status = wintypes.DWORD(0)
-    problem = wintypes.DWORD(0)
-    ret = cfgmgr32.CM_Get_DevNode_Status(ctypes.byref(status),
-                                         ctypes.byref(problem), devinst, 0)
-    if ret != 0:
-        return '查询失败(CR=0x%X)' % ret
-    if problem.value:
-        return '问题码 %d（%s）' % (problem.value,
-                                   _PROBLEM_TEXT.get(problem.value, '未知'))
-    return '正常'
-
-
-def list_class_devices(title, class_guid=None, enumerator=None, only_vid=None):
-    """列出一类设备（键盘/鼠标/HID/USB），输出 PNPDeviceID、名称、驱动服务、状态"""
-    flags = DIGCF_PRESENT
-    if class_guid is not None:
-        devs = setupapi.SetupDiGetClassDevsW(ctypes.byref(class_guid), None, None, flags)
-    else:
-        devs = setupapi.SetupDiGetClassDevsW(None, enumerator, None,
-                                             flags | DIGCF_ALLCLASSES)
-    print('\n---------- %s ----------' % title)
-    if devs == INVALID_HANDLE_VALUE or devs is None:
-        print('  枚举失败 err=%d' % ctypes.get_last_error())
-        return
-    shown = 0
-    total = 0
-    try:
-        n = 0
-        while True:
-            did = SP_DEVINFO_DATA()
-            did.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
-            if not setupapi.SetupDiEnumDeviceInfo(devs, n, ctypes.byref(did)):
-                break
-            n += 1
-            total += 1
-            inst = get_device_instance_id(devs, did) or '(取实例ID失败)'
-            if only_vid and ('VID_%04X' % only_vid) not in inst.upper():
-                continue
-            shown += 1
-            name = (get_reg_prop(devs, did, SPDRP_FRIENDLYNAME)
-                    or get_reg_prop(devs, did, SPDRP_DEVICEDESC) or '')
-            service = get_reg_prop(devs, did, SPDRP_SERVICE) or ''
-            compat = get_reg_prop(devs, did, SPDRP_COMPATIBLEIDS) or ''
-            print('  %s' % inst)
-            print('      名称=%s  服务=%s  状态=%s' % (name, service or '(无)', get_status(did.DevInst)))
-            if compat:
-                print('      CompatibleIDs=%s' % compat)
-    finally:
-        setupapi.SetupDiDestroyDeviceInfoList(devs)
-    print('  共 %d 个设备%s' % (total,
-                               '' if not only_vid else '，其中 VID_%04X 的 %d 个' % (only_vid, shown)))
-
-
-def print_device_lists():
-    list_class_devices('设备视角：键盘类 (Keyboard)', class_guid=GUID_DEVCLASS_KEYBOARD)
-    list_class_devices('设备视角：鼠标类 (Mouse)', class_guid=GUID_DEVCLASS_MOUSE)
-    list_class_devices('设备视角：HID 类（全部）', class_guid=GUID_DEVCLASS_HID)
-    list_class_devices('设备视角：USB 枚举器（仅 VID_%04X）' % VID,
-                       enumerator='USB', only_vid=VID)
-
-
 # ---------------- 抓包 ----------------
 def reader_worker(info, stop_event):
     label = collection_label(info.get('usage_page', 0), info.get('usage', 0), info['index'])
@@ -620,48 +438,6 @@ def reader_worker(info, stop_event):
                 last = data
     finally:
         kernel32.CloseHandle(h)
-
-
-# ---------------- 低层键盘钩子（键盘集合不可读时的替代观察） ----------------
-_hook_pressed = set()
-_hook_proc_ref = None
-
-
-def install_keyboard_hook():
-    """安装被动低层键盘钩子：只观察，不拦截，不影响正常输入"""
-    global _hook_proc_ref
-
-    def _proc(n_code, w_param, l_param):
-        if n_code >= 0 and w_param in (0x0100, 0x0104, 0x0101, 0x0105):
-            try:
-                kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                vk = kb.vkCode
-                scan = kb.scanCode
-                injected = ' (注入)' if kb.flags & 0x10 else ''
-                if w_param in (0x0100, 0x0104):
-                    if vk not in _hook_pressed:
-                        _hook_pressed.add(vk)
-                        print('%s [钩子] 按下 vk=0x%02X scan=0x%02X%s' % (
-                            now_str(), vk, scan, injected), flush=True)
-                else:
-                    if vk in _hook_pressed:
-                        _hook_pressed.discard(vk)
-                        print('%s [钩子] 抬起 vk=0x%02X scan=0x%02X%s' % (
-                            now_str(), vk, scan, injected), flush=True)
-            except Exception:
-                pass
-        return user32.CallNextHookEx(None, n_code, w_param, l_param)
-
-    _hook_proc_ref = HOOKPROC(_proc)
-    return user32.SetWindowsHookExW(WH_KEYBOARD_LL, _hook_proc_ref,
-                                    kernel32.GetModuleHandleW(None), 0)
-
-
-def pump_messages():
-    msg = MSG()
-    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
 
 
 # ---------------- 主流程 ----------------
@@ -698,7 +474,8 @@ def main():
         else:
             for info in same_vid:
                 print_collection_info(info)
-        print_device_lists()
+        print('\n设备节点与驱动绑定（WinUSB/HidUsb/usbccgp、问题码）请运行：')
+        print('  python tools\\enum_usb_nodes.py --classes')
         print('\n全量诊断结束。')
         return 0
 
@@ -712,8 +489,9 @@ def main():
                 print_collection_info(info)
         else:
             print('\n（HID 接口枚举结果为 0，请看上面的枚举统计定位是哪一步）')
-        print_device_lists()
-        print('\n建议：先运行 probe_keyboard.py --all 获取完整清单。')
+        print('\n设备节点与驱动绑定（WinUSB/HidUsb/usbccgp、问题码）请运行：')
+        print('  python tools\\enum_usb_nodes.py --classes')
+        print('\n建议：先运行 probe_keyboard.py --all 获取完整 HID 集合清单。')
         return 1
 
     print('\n---------- 匹配 VID/PID 的 HID 集合（共 %d 个） ----------' % len(matched))
@@ -751,21 +529,15 @@ def main():
         t = threading.Thread(target=reader_worker, args=(info, stop_event), daemon=True)
         t.start()
 
-    hook = None
     if not keyboard_readable:
-        hook = install_keyboard_hook()
-        if hook:
-            print('提示: 键盘集合被系统驱动独占，无法读取原始报告；'
-                  '已启用被动键盘钩子观察按键（不拦截，不影响正常输入）。')
-        else:
-            print('提示: 键盘集合不可读，且键盘钩子安装失败 err=%d。' % ctypes.get_last_error())
+        print('提示: 键盘集合被系统驱动独占，读不到原始报告。')
+        print('      要看系统最终收到的按键（VK 序列、注入标记、重复节奏），请另开窗口运行：')
+        print('        python tools\\compare_native.py record --out native.jsonl --label 原生')
 
     print('\n开始抓包，请在键盘上操作。按 q 或 Ctrl+C 结束。\n')
     try:
         import msvcrt
         while not stop_event.is_set():
-            if hook:
-                pump_messages()
             if msvcrt.kbhit():
                 ch = msvcrt.getch()
                 if ch in (b'q', b'Q', b'\x03'):
@@ -775,13 +547,8 @@ def main():
         pass
     finally:
         stop_event.set()
-        if hook:
-            user32.UnhookWindowsHookEx(hook)
         print('\n抓包结束。')
 
-    if _hook_pressed:
-        print('注意: 以下键仍在“按下”状态未抬起：%s' % (
-            ', '.join('0x%02X' % v for v in sorted(_hook_pressed))))
     return 0
 
 

@@ -15,7 +15,7 @@ Protocol 只在类型检查器里生效，运行时缺项不会报错；而这�
 5. 指示灯输出报告 —— Report ID / 长度 / 位定义（可选）
 
 usage→VK 的换算、自动重复语义、锁定键处理都不属于设备事实，统一放在
-``src/hid_usage.py``，由主机侧按 HID Usage Tables 通用处理——与 Windows 原生
+``keyboard_driver/usage.py``，由主机侧按 HID Usage Tables 通用处理——与 Windows 原生
 HID 键盘类的分工一致：固件自己决定上报哪些 usage，主机只做通用解释。
 
 只有"没有它就跑不起来"的成员是 ``@abstractmethod``；第 4、5 组属于可选能力，
@@ -30,7 +30,7 @@ class KeyboardDevice(ABC):
     """一个键盘设备的契约。
 
     子类代表**一把具体的键盘**，只放实测值；通用代码（keyboard.py /
-    keyboard_utils.py / tools）只通过包入口导出的名字使用它，不直接引用子类。
+    transport.py / tools）只通过包入口导出的名字使用它，不直接引用子类。
     """
 
     # ============================================================

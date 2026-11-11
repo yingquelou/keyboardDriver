@@ -5,10 +5,12 @@
 以及（有取舍时）``choose_consumer_report``。
 """
 
+from .. import win32_compat as win32con
+
 # ============================================================
 # 键盘输入报告布局
 # ============================================================
-# Win7 真机实测：键盘接口（MI_00）使用 8 字节 boot 报告，无 Report ID：
+# 实测（Win11 + WinUSB 接管）：键盘接口（MI_00）使用 8 字节 boot 报告，无 Report ID：
 #   raw[0]      8 位修饰键位图（bit0..7 = 左Ctrl/左Shift/左Alt/左Win/右Ctrl/右Shift/右Alt/右Win）
 #   raw[1]      保留字节
 #   raw[2:8]    6 个键码槽（HID usage，0 表示空槽）
@@ -103,9 +105,9 @@ LED_REPORT_ID = 0
 LED_REPORT_LENGTH = 1
 # (位, 对应锁定状态的 VK)；位序按 HID 输出报告定义
 LED_BITS = (
-    (0x01, 0x90),      # Num Lock
-    (0x02, 0x14),      # Caps Lock
-    (0x04, 0x91),      # Scroll Lock
+    (0x01, win32con.VK_NUMLOCK),
+    (0x02, win32con.VK_CAPITAL),
+    (0x04, win32con.VK_SCROLL),
 )
 # 锁定状态轮询间隔：只读系统状态，状态不变就不写 USB；10ms 让切层延迟接近原生。
 LED_POLL_INTERVAL_S = 0.01

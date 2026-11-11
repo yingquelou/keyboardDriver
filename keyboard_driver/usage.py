@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""hid_usage —— 通用 HID usage → Windows 虚拟键码（VK）映射。
+"""usage —— 通用 HID usage → Windows 虚拟键码（VK）映射。
 
 这里是**与具体键盘无关**的通用知识，取自 HID Usage Tables：
 
@@ -17,7 +17,7 @@
 它们的虚拟键码就是 ASCII 码），因此这两组按下标规律生成。
 """
 
-import win32_compat as win32con
+from . import win32_compat as win32con
 
 KEYMAP = {}
 

@@ -3,16 +3,18 @@
 
 用途：确认一台机器上 MI_00 / MI_01 两个接口节点是否存在、各自绑定到哪个驱动，
       从而解释「Zadig 列表只显示一条，但 pyusb 实际能用两个接口」这类展示差异。
-      （已知在 Win7 上 python 方式运行驱动正常，说明系统层两个接口可用；
+      （Win7 观察已复验：2026-11-10 在一台 Win7 SP1 x64 上，libusb 枚举到 8 个 1EA7:0066 节点，
+        键盘接口与消费类接口 claim 均成功；同一轮里 master 源码形态跑通，见 README「验证记录」。
         Zadig 的条目数取决于它列出的单位与过滤规则，不一定等于接口数。）
 
 只依赖 Python 标准库 + ctypes（setupapi / cfgmgr32），不需要 pyusb、pywin32；
 全部是只读查询，不安装、不修改、不重绑任何驱动。Python 3.x（32/64 位）均可运行。
 
 用法：
-    python enum_usb_nodes.py                  # VID/PID 默认取自 src\\device_profile\\identity.py
+    python enum_usb_nodes.py                  # VID/PID 默认取自 keyboard_driver\\device_profile\\identity.py
     python enum_usb_nodes.py --vid <HEX> --pid <HEX>
     python enum_usb_nodes.py --all-nodes      # 打印枚举到的全部 USB 节点（可能很长）
+    python enum_usb_nodes.py --classes        # 另列键盘/鼠标/HID 类设备（原 probe_keyboard --all 的能力）
     python enum_usb_nodes.py --sample 5       # 自检时列出的示例节点个数（默认 3）
 
 判读要点：
@@ -38,10 +40,10 @@ from ctypes import wintypes
 
 
 def profile_defaults():
-    """从 src\\device_profile\\identity.py 读取默认 VID/PID（避免在通用工具里重复硬编码）"""
-    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
-    sys.path.insert(0, src_dir)
-    from device_profile import VID, PID
+    """从 keyboard_driver\\device_profile\\identity.py 读取默认 VID/PID（避免在通用工具里重复硬编码）"""
+    root_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    sys.path.insert(0, root_dir)
+    from keyboard_driver.device_profile import VID, PID
     return '%04X' % VID, '%04X' % PID
 
 DIGCF_PRESENT = 0x02
@@ -53,6 +55,7 @@ SPDRP_COMPATIBLEIDS = 0x02
 SPDRP_SERVICE = 0x04
 SPDRP_CLASS = 0x07
 SPDRP_DRIVER = 0x09
+SPDRP_FRIENDLYNAME = 0x0C
 SPDRP_LOCATION_INFORMATION = 0x0D
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -73,6 +76,18 @@ class SP_DEVINFO_DATA(ctypes.Structure):
                 ("ClassGuid", GUID),
                 ("DevInst", wintypes.DWORD),
                 ("Reserved", ctypes.c_void_p)]
+
+
+# 设备安装类 GUID：HID / 键盘 / 鼠标（用于 --classes 的类设备列表）
+GUID_DEVCLASS_HID = GUID(
+    0x745A17A0, 0x74D3, 0x11D0,
+    (ctypes.c_ubyte * 8)(0xB6, 0xFE, 0x00, 0xA0, 0xC9, 0x0F, 0x57, 0xDA))
+GUID_DEVCLASS_KEYBOARD = GUID(
+    0x4D36E96B, 0xE325, 0x11CE,
+    (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
+GUID_DEVCLASS_MOUSE = GUID(
+    0x4D36E96F, 0xE325, 0x11CE,
+    (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
 
 
 setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
@@ -290,6 +305,60 @@ def classify(rec, present):
     return 'present_unbound'
 
 
+def list_class_devices(title, class_guid=None, enumerator=None, only_vid=None):
+    """按设备安装类（或枚举器）列出 devnode：实例 ID、名称、service、状态。
+
+    对应原来 probe_keyboard.py --all 末尾的“设备视角”列表；现在只在这里实现。
+    """
+    flags = DIGCF_PRESENT
+    if class_guid is not None:
+        devs = setupapi.SetupDiGetClassDevsW(ctypes.byref(class_guid), None, None, flags)
+    else:
+        devs = setupapi.SetupDiGetClassDevsW(None, enumerator, None,
+                                             flags | DIGCF_ALLCLASSES)
+    print('\n---------- %s ----------' % title)
+    if devs == INVALID_HANDLE_VALUE or devs is None:
+        print('  枚举失败 err=%d' % ctypes.get_last_error())
+        return
+    shown = 0
+    total = 0
+    try:
+        index = 0
+        while True:
+            did = SP_DEVINFO_DATA()
+            did.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+            if not setupapi.SetupDiEnumDeviceInfo(devs, index, ctypes.byref(did)):
+                break
+            index += 1
+            total += 1
+            instance = get_instance_id(devs, did) or '(取实例ID失败)'
+            if only_vid and ('VID_%04X' % only_vid) not in instance.upper():
+                continue
+            shown += 1
+            name = (get_prop_text(devs, did, SPDRP_FRIENDLYNAME)
+                    or get_prop_text(devs, did, SPDRP_DEVICEDESC) or '')
+            service = get_prop_text(devs, did, SPDRP_SERVICE) or ''
+            status, problem, cr = get_status(did.DevInst)
+            state = status_text(status, problem) if cr == 0 else '查询失败(CR=0x%X)' % cr
+            print('  %s' % instance)
+            print('      名称=%s  服务=%s  状态=%s' % (name, service or '(无)', state))
+            compat = get_prop_text(devs, did, SPDRP_COMPATIBLEIDS)
+            if compat:
+                print('      CompatibleIDs=%s' % compat)
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(devs)
+    print('  共 %d 个设备%s' % (
+        total, '' if not only_vid else '，其中 VID_%04X 的 %d 个' % (only_vid, shown)))
+
+
+def print_class_devices(vid):
+    list_class_devices('设备视角：键盘类 (Keyboard)', class_guid=GUID_DEVCLASS_KEYBOARD)
+    list_class_devices('设备视角：鼠标类 (Mouse)', class_guid=GUID_DEVCLASS_MOUSE)
+    list_class_devices('设备视角：HID 类（全部）', class_guid=GUID_DEVCLASS_HID)
+    list_class_devices('设备视角：USB 枚举器（仅 VID_%04X）' % vid,
+                       enumerator='USB', only_vid=vid)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='只读枚举 VID/PID 对应的 USB 设备节点（父设备 + 复合设备接口）')
@@ -299,6 +368,8 @@ def main():
                         help='PID，十六进制（默认取 device_profile 包）')
     parser.add_argument('--all-nodes', action='store_true',
                         help='打印枚举到的全部 USB 节点实例 ID')
+    parser.add_argument('--classes', action='store_true',
+                        help='另列键盘/鼠标/HID 类设备（原 probe_keyboard --all 的能力）')
     parser.add_argument('--sample', type=int, default=3,
                         help='自检时列出的示例节点个数（默认 3）')
     args = parser.parse_args()
@@ -307,7 +378,7 @@ def main():
         try:
             default_vid, default_pid = profile_defaults()
         except Exception as exc:
-            print('无法从 src\\device_profile\\identity.py 读取默认 VID/PID（%s）；'
+            print('无法从 keyboard_driver\\device_profile\\identity.py 读取默认 VID/PID（%s）；'
                   '请用 --vid/--pid 指定' % exc)
             return 2
         args.vid = args.vid or default_vid
@@ -327,6 +398,9 @@ def main():
         platform.python_version(),
         64 if ctypes.sizeof(ctypes.c_void_p) == 8 else 32))
     print('目标: VID_%04X&PID_%04X' % (vid, pid))
+
+    if args.classes:
+        print_class_devices(vid)
 
     present_records = collect(DIGCF_PRESENT)
     if present_records is None:
@@ -434,7 +508,7 @@ def main():
 
     print('\n判读提示（对照 Zadig 列表）：')
     print('  * MI_00、MI_01 都在且都绑 WinUSB → Zadig 条目数的差异只是列表口径，')
-    print('    不影响运行；按“文档记录项”处理，不需要改动（Win7 上 python 已实测可用两个接口）。')
+    print('    不影响运行；按“文档记录项”处理，不需要改动（Win7 SP1 x64 上已复验：两个接口均可用）。')
     print('  * 只有父节点、service=WinUSB → 整设备接管：Zadig 只列 1 条是正常的，')
     print('    pyusb 仍可从该设备节点访问多个接口。')
     print('  * 节点“存在且已绑定”但 Zadig 未列出 → Zadig 按驱动键过滤；')

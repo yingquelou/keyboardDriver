@@ -19,16 +19,24 @@ compare
     把连续记录切分为“按键段”：同一 VK 的按下→抬起为一段，段内的重复 keydown
     即自动重复。对每个 VK 统计段数、每段重复次数、首延迟与重复间隔，逐键输出差异。
 
-只依赖标准库 + ctypes，不需要 pywin32，也不需要管理员权限。
+只依赖标准库 + ctypes（VK 常量名取自 keyboard_driver\\win32_compat，不 import pyusb），
+不需要 pywin32，也不需要管理员权限。
+
+边界：本脚本是仓库里唯一安装 LL 键盘钩子的地方。它看的是系统最终收到的按键
+（VK + 注入标记 + 重复节奏），不是 HID usage、也不是原始报文——那两类分别用
+calibrate 与 native_probe.py。
 """
 
 import argparse
 import ctypes
 import datetime
 import json
+import os
 import sys
 import time
 from ctypes import wintypes
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 WH_KEYBOARD_LL = 13
 LLKHF_INJECTED = 0x10
@@ -64,7 +72,7 @@ kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
 # ---------- VK 名称（取自 win32_compat，避免依赖 pywin32） ----------
 def _build_vk_names():
     try:
-        import win32_compat as compat
+        from keyboard_driver import win32_compat as compat
     except ImportError:
         return {}
     names = {}

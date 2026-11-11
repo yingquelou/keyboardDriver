@@ -4,7 +4,7 @@
 本项目**唯一**允许出现"该键盘专有事实"的地方，而且只记录**报告布局类事实**：
 VID/PID、接口角色、键盘/消费类报告布局、指示灯输出报告格式。
 
-usage→VK 换算和自动重复语义不在这里，放在通用模块 ``src/hid_usage.py``：
+usage→VK 换算和自动重复语义不在这里，放在通用模块 ``keyboard_driver/usage.py``：
 设备固件自己按 Num Lock 灯位切换上报的 usage，主机只扮演通用 HID 键盘类驱动。
 
 包内按职责拆分（换键盘时**只改这个包**，文件名/导出名保持不变）：
@@ -15,7 +15,6 @@ usage→VK 换算和自动重复语义不在这里，放在通用模块 ``src/hi
     device.py     当前键盘对契约的实现（只做装配，委托下面两个模块）
     identity.py   身份与接口角色：VID/PID、接口判定、端点预期   ← 换 VID/PID 改这里
     reports.py    报告布局：键盘报告、消费类 Report ID 与 usage、指示灯输出报告
-    _win32.py     win32 常量入口与 VK 补全（私有，不对外）
 
 本模块只做"实例化一份 + 导出"，不含实现：``PROFILE`` 是当前设备的唯一实例
 （运行时单设备、单进程），下面把契约成员绑成模块级别名，保持原有导入方式。
@@ -24,7 +23,6 @@ usage→VK 换算和自动重复语义不在这里，放在通用模块 ``src/hi
 改完跑 ``python tools\\check_device_profile.py`` 做一致性自检。
 """
 
-from ._win32 import win32con
 from .contract import KeyboardDevice
 from .device import Wireless1EA7_0066
 
@@ -74,9 +72,7 @@ LED_BITS = PROFILE.led_bits
 led_report = PROFILE.led_report
 
 # 公共符号清单（当日志/诊断代码用 import * 时行为不变）。
-# win32con 也在其中，因为旧单文件版本会把导入的 win32con 一并暴露。
 __all__ = [
-    'win32con',
     'NAME', 'VID', 'PID',
     'INTERFACE_CLASS_HID', 'KEYBOARD_INTERFACE_SUBCLASS', 'KEYBOARD_INTERFACE_PROTOCOL',
     'is_keyboard_interface', 'is_consumer_interface',

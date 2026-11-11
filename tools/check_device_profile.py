@@ -8,9 +8,11 @@
 - 方法签名：实现的方法参数个数与契约一致（少一个/多一个都算不合格）；
 - 键盘报告：长度为正、修饰键与键槽区间自洽、残包返回 ``(0, None)``、读取长度覆盖；
 - 消费类报告：Report ID 与 usage 布局自洽、按 Report ID 过滤、长度不足丢弃；
-- 通用映射：hid_usage 覆盖字母区与小键盘 usage（0x0D 与 0x59 并存）、未映射返回
+- 通用映射：usage 覆盖字母区与小键盘 usage（0x0D 与 0x59 并存）、未映射返回
   ``None``、锁定键/可重复消费键的语义正确、包里不再暴露任何"层"概念；
-- 指示灯：报告长度固定、Report ID 处理正确、位图截断正确、位定义合法。
+- 指示灯：报告长度固定、Report ID 处理正确、位图截断正确、位定义合法；
+- 导出表：``device_profile.__all__`` 与 ``transport.__all__`` 中的名字都存在、
+  没有公共名漏出、不含层相关旧符号。
 
 用法：
     python tools\\check_device_profile.py
@@ -22,13 +24,14 @@ import inspect
 import os
 import sys
 
-# 本文件位于 tools/：把 src/ 加入模块搜索路径，避免依赖当前工作目录。
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+# 本文件位于 tools/：把项目根加入模块搜索路径，按包名导入 keyboard_driver。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import device_profile as profile
-import hid_usage
-from device_profile import win32con
-from device_profile.contract import KeyboardDevice
+from keyboard_driver import device_profile as profile
+from keyboard_driver import usage
+from keyboard_driver import transport
+from keyboard_driver import win32_compat as win32con
+from keyboard_driver.device_profile.contract import KeyboardDevice
 
 _passed = 0
 _failures = []
@@ -159,12 +162,14 @@ def check_consumer_report():
 
 
 def check_usage_map():
-    print("\n== 6. 通用 usage 映射（hid_usage） ==")
-    check('device_profile 不再暴露层概念',
+    print("\n== 6. 通用 usage 映射（usage） ==")
+    # 反向断言：以下名字属于已删除的"软件层切换"方案，这里显式要求它们**不存在**，
+    # 防止旧符号被重新引入。不是残留引用，不要当成待清理代码。
+    check('device_profile 不再暴露层概念（回归防线）',
           not any(hasattr(profile, n) for n in
                   ('LAYERS', 'LAYER_ORDER', 'DEFAULT_LAYER_NAME', 'LAYER_TOGGLE_HID',
                    'is_layer_toggle', 'next_layer_name', 'keymap_subsets')))
-    keymap = hid_usage.KEYMAP
+    keymap = usage.KEYMAP
     check('KEYMAP 为非空映射', isinstance(keymap, dict) and bool(keymap),
           repr(type(keymap)))
     check('KEYMAP 的值全为整数 VK',
@@ -180,26 +185,26 @@ def check_usage_map():
           repr(keymap.get(0x59)))
     check('0x53 -> VK_NUMLOCK（锁定键按 usage 转发）',
           keymap.get(0x53) == win32con.VK_NUMLOCK, repr(keymap.get(0x53)))
-    check('未映射 usage 返回 None', hid_usage.get_vk(0xFFFF) is None)
+    check('未映射 usage 返回 None', usage.get_vk(0xFFFF) is None)
     check('消费类映射非空且音量键可映射',
-          bool(hid_usage.CONSUMER)
-          and hid_usage.get_consumer_vk(0xE9) == win32con.VK_VOLUME_UP,
-          repr(hid_usage.get_consumer_vk(0xE9)))
+          bool(usage.CONSUMER)
+          and usage.get_consumer_vk(0xE9) == win32con.VK_VOLUME_UP,
+          repr(usage.get_consumer_vk(0xE9)))
     check('未映射消费类 usage 返回 None',
-          hid_usage.get_consumer_vk(0xFFFF) is None)
+          usage.get_consumer_vk(0xFFFF) is None)
 
 
 def check_policy():
     print("\n== 7. 重复语义与指示灯 ==")
-    check('repeats_key(None) 为假', hid_usage.repeats_key(None) is False)
-    for vk in hid_usage.NO_REPEAT_VKS:
+    check('repeats_key(None) 为假', usage.repeats_key(None) is False)
+    for vk in usage.NO_REPEAT_VKS:
         check('免重复键 0x%02X 不参与重复' % vk,
-              hid_usage.repeats_key(vk) is False)
-    for vk in hid_usage.CONSUMER_REPEAT_VKS:
+              usage.repeats_key(vk) is False)
+    for vk in usage.CONSUMER_REPEAT_VKS:
         check('消费类重复键 0x%02X 参与重复' % vk,
-              hid_usage.repeats_consumer(vk) is True)
+              usage.repeats_consumer(vk) is True)
     check('未声明的消费类键不参与重复',
-          hid_usage.repeats_consumer(0) is False)
+          usage.repeats_consumer(0) is False)
 
     length = profile.LED_REPORT_LENGTH
     report = profile.led_report(0xFF)
@@ -227,6 +232,37 @@ def check_policy():
               repr(profile.LED_POLL_INTERVAL_S))
 
 
+def check_exports():
+    print("\n== 8. 导出表 ==")
+    exported = list(profile.__all__)
+    check('device_profile.__all__ 无重复项', len(exported) == len(set(exported)),
+          repr(len(exported)))
+    missing = sorted(n for n in exported if not hasattr(profile, n))
+    check('__all__ 中的名字都能从包里取到', not missing, ', '.join(missing))
+    # 类名与子模块按设计不进 __all__（可直接导入，但不是对外承诺面）。
+    intentional = {'PROFILE', 'KeyboardDevice', 'Wireless1EA7_0066',
+                   'contract', 'device', 'identity', 'reports'}
+    leaked = sorted(n for n in dir(profile)
+                    if not n.startswith('_') and n not in exported and n not in intentional)
+    check('没有公共名漏出 __all__', not leaked, ', '.join(leaked))
+    check('__all__ 不含层相关旧符号',
+          not any('layer' in n.lower() for n in exported))
+    check('device_profile 不再转手 win32con（通用常量归 win32_compat）',
+          not hasattr(profile, 'win32con') and 'win32con' not in exported)
+
+    utils_all = list(transport.__all__)
+    utils_missing = sorted(n for n in utils_all if not hasattr(transport, n))
+    check('transport.__all__ 中的名字都存在', not utils_missing,
+          ', '.join(utils_missing))
+    check('transport 导出 has_active_keys（主循环按它切换读超时）',
+          hasattr(transport, 'has_active_keys') and 'has_active_keys' in utils_all)
+    check('transport 不再重复导出 usage→VK 换算（归 usage）',
+          not hasattr(transport, 'get_vk')
+          and not hasattr(transport, 'get_vk_name'))
+    check('transport.__all__ 不含层相关旧符号',
+          not any('layer' in n.lower() or 'toggle' in n.lower() for n in utils_all))
+
+
 def main():
     print("device_profile 一致性自检：%s (%s)" % (profile.NAME, type(profile.PROFILE).__name__))
     check_instantiation()
@@ -236,6 +272,7 @@ def main():
     check_consumer_report()
     check_usage_map()
     check_policy()
+    check_exports()
 
     print("\n---- 结果：%d 项通过，%d 项失败 ----" % (_passed, len(_failures)))
     if _failures:

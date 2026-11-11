@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
+"""运行期编排：单实例、消费类/指示灯线程、主读取循环、断线重连。
+
+USB 读写的原语（枚举、claim、单次读取、注入状态机、灯位回写）在 transport.py；
+进程入口在 __main__.py，计划任务/日志外壳在 run.py；设备事实在 device_profile 包。本文件不重复这些职责。
+"""
+import ctypes
 import sys
 import time
 import threading
-import app_paths
+from . import paths
 
 # 打包形态下 libusb-1.0.dll 可能位于 sys._MEIPASS（onefile），
-# 必须在导入 pyusb 后端与 keyboard_utils 之前把该目录加入 DLL 搜索路径。
-app_paths.prepare_native_dlls()
+# 必须在导入 pyusb 后端与 transport 之前把该目录加入 DLL 搜索路径。
+paths.prepare_native_dlls()
 
 import usb.core
-import device_profile as profile
-from keyboard_utils import (
+from . import device_profile as profile
+from .transport import (
     find_device, configure_device, read_report, find_consumer_endpoint,
     read_consumer_report, parse_keyboard_report, parse_consumer_report,
-    simulate_modifiers, simulate_keys, simulate_key,
+    simulate_modifiers, simulate_keys,
     simulate_consumer_usage, update_key_repeats, release_all_keys,
     has_active_keys, read_lock_bitmap, write_led_bitmap,
     get_device_product
@@ -23,6 +29,42 @@ from keyboard_utils import (
 # 有键按下（特别是自动重复进行中）时用短超时，减小重复补发的时间抖动。
 IDLE_READ_TIMEOUT_MS = 100
 ACTIVE_READ_TIMEOUT_MS = 2
+
+# ---------- 单实例互斥 ----------
+# WinUSB 允许同一接口被多个进程同时打开，两个实例会各读一份报告、各注入一次按键
+# （表现为每个键触发两次）。用命名互斥体保证同一时刻只有一个实例。
+# 句柄是进程级对象：进程退出（含崩溃）时由系统释放，所以异常退出不会留下永久占用的锁。
+# 用 "Local\" 前缀：互斥范围是当前登录会话，与"只影响本会话的注入"一致。
+# 名字里的 VID/PID 取自设备包，本文件不写死本键盘的身份。
+INSTANCE_MUTEX_NAME = "Local\\KeyboardDriver_%04X_%04X" % (profile.VID, profile.PID)
+ERROR_ALREADY_EXISTS = 183
+
+_kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+_kernel32.CreateMutexW.restype = ctypes.c_void_p
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.CloseHandle.restype = ctypes.c_int
+
+
+def acquire_single_instance():
+    """取单实例互斥；已有实例时打印原因并退出，返回需在退出前释放的句柄"""
+    handle = _kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    if not handle:
+        # 创建失败不阻断运行：宁可重复注入，也不要让用户完全没键盘
+        print(f"[警告] 创建单实例互斥体失败（错误码 {ctypes.get_last_error()}），继续运行")
+        return None
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        print("[错误] 已有另一个键盘驱动实例在运行。")
+        print("       同一接口被两个实例同时读取会让每个按键被注入两次，本次启动已取消。")
+        print("       请先关闭已运行的实例（或结束残留的 python/keyboard 进程）再试。")
+        sys.exit(1)
+    return handle
+
+
+def release_single_instance(handle):
+    if handle:
+        _kernel32.CloseHandle(handle)
 
 # ---------- 消费类按键线程 ----------
 # 音量/多媒体/浏览器键由消费类接口上报，与键盘接口分开。
@@ -34,15 +76,15 @@ def consumer_loop(dev, ep, stop_event):
         try:
             raw = read_consumer_report(dev, ep)
         except Exception as e:
-            # 接口暂时不可用（例如设备刚断开）时静默重试；整体重连仍由主循环负责
+            # 不在这里重新打开设备：同一进程重复打开同一复合设备会互相干扰
+            # （见 find_consumer_endpoint 的注释），那样"自愈"反而会弄坏媒体键。
+            # 这里只记录并原地重试；节点被重新枚举时由主循环整体重连，
+            # 重连成功后新线程会拿到主循环提供的设备与端点继续工作。
             if not warned:
-                print(f"[警告] 消费类接口读取失败: {e}（将静默重试）")
+                print(f"[警告] 消费类接口读取失败: {e}（原地重试，重连交由主循环）")
                 warned = True
             if stop_event.wait(1.0):
                 return
-            found = find_consumer_endpoint()
-            if found is not None:
-                dev, ep = found[0], found[1]
             continue
         usage = parse_consumer_report(raw)
         if usage is not None:
@@ -112,7 +154,7 @@ def process_loop(dev, ep, enable_led=False):
                 if modifier != prev_modifier:
                     simulate_modifiers(modifier, prev_modifier)
                     prev_modifier = modifier
-                # 处理普通键变化（含锁定键：按 usage 通用映射转发，见 hid_usage）
+                # 处理普通键变化（含锁定键：按 usage 通用映射转发，见 usage）
                 if keys != prev_keys:
                     simulate_keys(keys, prev_keys)
                     # 注意：simulate_keys 会修改 prev_keys，因此这里不需要再赋值
@@ -130,11 +172,18 @@ def process_loop(dev, ep, enable_led=False):
         if led_thread is not None:
             led_thread.join(timeout=0.5)
         release_all_keys()
-        simulate_consumer_usage(0)
         print("已释放所有按键。")
 
 # ---------- 主程序（带自动重连） ----------
 def main():
+    mutex = acquire_single_instance()   # 已有实例时在这里直接退出（exit 1）
+    try:
+        _run()
+    finally:
+        release_single_instance(mutex)
+
+
+def _run():
     print("启动正常模式...")
     # 指示灯默认值由设备模块声明：--led 强制开启，--no-led 强制关闭
     if '--led' in sys.argv[1:]:
@@ -170,6 +219,3 @@ def main():
             print(f"发生未预期错误: {e}，{retry_interval}秒后重试...")
             time.sleep(retry_interval)
             continue
-
-if __name__ == "__main__":
-    main()

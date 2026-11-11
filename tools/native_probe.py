@@ -26,13 +26,13 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import usb.backend.libusb1
 import usb.core
 import usb.util
 
-import device_profile as profile
+from keyboard_driver import device_profile as profile
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 user32.GetKeyState.restype = ctypes.c_short

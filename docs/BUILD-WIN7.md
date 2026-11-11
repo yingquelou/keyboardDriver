@@ -1,5 +1,11 @@
 # 在目标系统上手工打包为 exe（PyInstaller）
 
+> **未实机验证（针对 exe 形态）**：本文是打包步骤与版本建议，不是当前版本打包产物在 Win7 上的验证结论。
+> 已知的 Win7 实测只有两条，且都不覆盖 exe 形态：**当前版本的源码形态**已在一台 Win7 SP1 x64 实机上跑通
+> （登录会话 1 控制台，见 [README](../README.md)「验证记录」）；**存档版本曾在 Win7 以 exe 形态运行过**
+> （tag `archive-soft-layer-switch`，用户报告层切换 / 长按自动重复 / 媒体键均通过），但那是旧代码与旧构建。
+> **当前版本的打包产物未在 Win7 验证**，本文命令也未在 Win7 执行过；当前版本的实测基准是 Windows 11 + WinUSB 接管。
+
 项目**不提供打包脚本**。本文给出可直接复制执行的 PyInstaller 命令，以及入口、隐藏导入、
 libusb DLL 放置和版本建议。产物不随仓库分发；建议**在目标系统上构建**（理由见第 8 节）。
 
@@ -14,7 +20,7 @@ libusb DLL 放置和版本建议。产物不随仓库分发；建议**在目标�
 | Python | **3.8.10** | 最后一个官方支持 Windows 7 的 Python；产物依赖它自带的 `python38.dll`。**位数决定 exe 位数** |
 | PyInstaller | `"pyinstaller<6"`（当前解析到 5.13.2） | 5.13.2 是最后一条 5.x 稳定线，Win7 成功案例最多。**不加约束时** 3.8 上 pip 会装 6.x：6.x 换过 bootloader，对 Win7 没有任何兼容承诺 |
 | pyusb | 不指定 | 3.8 上 pip 会选 1.2.1（1.3.x 要求 ≥3.9）。程序用到的 API 两版一致 |
-| libusb-1.0 | 1.0.26 线优先 | Win7 可用；来源见第 3 节 |
+| libusb-1.0 | 1.0.26 线优先 | 与 Win7 兼容的版本线；已跑通的 Win7 源码形态用的是系统 `C:\Windows\System32` 的 1.0.30 x64，打包形态未验证（见第 9 节）；来源见第 3 节 |
 
 PyInstaller 5.x 与 6.x 的官方文档都只写 **Windows 8 及以上**
 （5.13.2：<https://pyinstaller.org/en/v5.13.2/requirements.html>），Win7 不在官方承诺内。
@@ -65,12 +71,12 @@ python -m venv .venv
 ### 4.1 onedir（推荐）
 
 ```bat
-python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
-  --hidden-import usb.backend.libusb1 --hidden-import app_paths ^
+python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths . ^
+  --hidden-import usb.backend.libusb1 ^
   --add-binary "libusb\x64\libusb-1.0.dll;." ^
   --exclude-module tkinter --exclude-module unittest --exclude-module pydoc_data ^
   --console --onedir --distpath dist --workpath build ^
-  src\run_keyboard.py
+  keyboard_driver\run.py
 ```
 
 - 32 位 Python 把 `libusb\x64\...` 改成 `libusb\x86\...`；用 libusb-package 时换成它打印出的绝对路径。
@@ -79,31 +85,30 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 ### 4.2 onefile（单文件）
 
 ```bat
-python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
-  --hidden-import usb.backend.libusb1 --hidden-import app_paths ^
+python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths . ^
+  --hidden-import usb.backend.libusb1 ^
   --add-binary "libusb\x64\libusb-1.0.dll;." ^
   --exclude-module tkinter --exclude-module unittest --exclude-module pydoc_data ^
   --console --onefile --distpath dist --workpath build ^
-  src\run_keyboard.py
+  keyboard_driver\run.py
 ```
 
 ### 4.3 参数说明（每一项都对应真实选项）
 
 | 参数 | 作用 |
 |---|---|
-| `src\run_keyboard.py` | 入口：写 `logs\keyboard.log` 后调用 `keyboard.main()`。直接打 `src\keyboard.py` 也可运行，但不会写日志 |
-| `--paths src` | 把 `src\` 加入模块搜索路径（`app_paths`、`keyboard_utils`、`device_profile`、`win32_compat`） |
+| `keyboard_driver\run.py` | 入口：写 `logs\keyboard.log` 后调用 `driver.main()`。直接 `python -m keyboard_driver` 也可运行，但不会写日志 |
+| `--paths .` | 把项目根加入模块搜索路径，让 PyInstaller 的静态分析找到 `keyboard_driver` 包（`run.py` 以脚本形态运行时也按这个路径导入） |
 | `--hidden-import usb.backend.libusb1` | pyusb 的后端是运行时动态选择，静态分析看不到，必须显式声明 |
-| `--hidden-import app_paths` | 同上，避免漏收 |
 | `--add-binary "...;."` | 把 libusb DLL 放进产物（onedir 落在 exe 同级；onefile 落进 `_MEIPASS`） |
 | `--exclude-module tkinter` 等 | 排除用不到的大模块，减小产物 |
-| `--console` | 控制台程序；`src\run_keyboard.py` 会同时写日志与屏幕。不想要登录时的控制台窗口可改 `--windowed`，日志仍写入文件 |
+| `--console` | 控制台程序；`keyboard_driver\run.py` 会同时写日志与屏幕。不想要登录时的控制台窗口可改 `--windowed`，日志仍写入文件 |
 | `--onedir` / `--onefile` | 产物形态（区别见第 6 节） |
 | `--name` | 产物名（`KeyboardDriver`） |
 | `--noconfirm --clean` | 覆盖旧产物、清空缓存 |
 
 仓库里**没有安装器/卸载器 exe**：安装与卸载改为手工命令，见 [INSTALL-WIN7.md](INSTALL-WIN7.md)
-第 3.7、5 节（`schtasks` 注册自启、设备管理器/`pnputil` 恢复原生驱动）。
+第 3.8、5 节（`schtasks` 注册自启、设备管理器/`pnputil` 恢复原生驱动）。
 
 ## 5. libusb DLL 在两种形态下的放置
 
@@ -111,10 +116,12 @@ python -m PyInstaller --noconfirm --clean --name KeyboardDriver --paths src ^
 |---|---|---|
 | onedir（5.x） | 与 `KeyboardDriver.exe` 同目录 | Windows 默认搜索顺序即可命中 |
 | onedir（6.x） | `_internal\libusb-1.0.dll` | 同上 |
-| onefile | 被解包到 `%TEMP%\_MEIxxxx\` | `src\app_paths.py: prepare_native_dlls()` 在导入 pyusb **之前**把 `sys._MEIPASS` 加入 `PATH` 并调用 `os.add_dll_directory()` |
+| onefile | 被解包到 `%TEMP%\_MEIxxxx\` | `keyboard_driver\paths.py: prepare_native_dlls()` 在导入 pyusb **之前**把 `sys._MEIPASS` 加入 `PATH` 并调用 `os.add_dll_directory()` |
 
-`prepare_native_dlls()` 只在 frozen（打包）形态生效，源码运行不受影响；它同时尝试
-`resource_dir()`、`app_dir()` 及其下的 `libusb\` 子目录。
+`prepare_native_dlls()` 在两种形态下都生效：打包形态按上表查找（它同时尝试
+`resource_dir()`、`app_dir()` 及其下的 `libusb\` 子目录）；源码形态按解释器位数加入项目根的
+`libusb\x64` 或 `libusb\x86`。源码分支是为登录自启准备的——`schtasks` 拉起的进程不继承
+交互 shell 的 PATH，所以不能靠手工 `set PATH`。
 
 ## 6. 产物结构与自检
 
@@ -141,7 +148,7 @@ onefile：`dist\KeyboardDriver.exe`（单文件，运行时自解包到临时目
 3. **设备枚举**：日志出现“设备未找到”＝Zadig 未绑定、绑定被系统还原，或 libusb DLL 缺失/位数不符；
    出现 `USB 错误: [Errno 13] Access denied`＝已有另一个实例占用接口，先结束旧进程。
 4. **按键**：Num Lock 切换后字母区改出小键盘字符（固件按灯位切层）、长按重复、音量±（含长按连续调节）、静音、播放/暂停、上下曲；外置键盘的 Num Lock 灯随系统 Num Lock 状态亮灭（该键盘只有这一颗灯，Caps 状态无法在它上面肉眼验证）。
-5. **自启（可选）**：按 [INSTALL-WIN7.md](INSTALL-WIN7.md) 3.7 节创建任务，`/TR` 指向 exe 绝对路径；
+5. **自启（可选）**：按 [INSTALL-WIN7.md](INSTALL-WIN7.md) 3.8 节创建任务，`/TR` 指向 exe 绝对路径；
    onedir 必须连同整个产物目录一起移动。
 
 ## 7. onedir 与 onefile 的取舍
@@ -170,11 +177,13 @@ onefile：`dist\KeyboardDriver.exe`（单文件，运行时自解包到临时目
 
 ## 9. 验证状态（如实标注）
 
-- 本文所有命令均为**静态核对**：入口文件 `src\run_keyboard.py`、模块 `app_paths`、
+- 本文所有命令均为**静态核对**：入口文件 `keyboard_driver\run.py`、包 `keyboard_driver`、
   `usb.backend.libusb1` 与 PyInstaller 选项（`--paths`、`--hidden-import`、`--add-binary`、
   `--exclude-module`、`--console`、`--onedir`、`--onefile`、`--distpath`、`--workpath`、
   `--name`、`--noconfirm`、`--clean`）均真实存在。
-- `src/`、`tools/` 下脚本 `py_compile` 通过。
+- `keyboard_driver/`、`tools/` 下脚本 `py_compile` 通过。
 - **未执行真实打包**（本机未安装 PyInstaller）：Python 3.8.10 + PyInstaller 5.x 的实际构建、
   onedir/onefile 的 DLL 加载、frozen 分支（`sys.executable` / `sys._MEIPASS`）与日志落点、
-  杀软拦截与冷启动耗时，都必须在目标机实测。
+  杀软拦截与冷启动耗时，都必须在目标机实测。以上针对当前版本的 exe 形态；当前版本的**源码形态**
+  已在一台 Win7 SP1 x64 实机上跑通（见 [README](../README.md)「验证记录」），存档软切换版也曾在 Win7
+  以 exe 形态运行并跑通三项行为，但两者都不构成当前版本的打包验收。

@@ -2,7 +2,7 @@
 """当前设备（1EA7:0066 无线键盘）对 ``KeyboardDevice`` 契约的实现。
 
 本文件只做**装配**：把契约成员接到 identity / reports 两个职责模块，
-自身不含新的数据或算法。usage→VK 换算与自动重复语义不在这里（见 ``src/hid_usage.py``）：
+自身不含新的数据或算法。usage→VK 换算与自动重复语义不在这里（见 ``keyboard_driver/usage.py``）：
 固件自己按 Num Lock 灯位切换上报的 usage，主机侧按 HID Usage Tables 通用解释即可。
 
 运行时仍然是单设备、单进程：包入口只实例化本类一次。
@@ -22,6 +22,11 @@ class Wireless1EA7_0066(KeyboardDevice):
 
     # ---- 2. 接口角色 ----
     # 复合设备由 usbccgp 拆成多个同 VID/PID 的节点，按描述符角色识别，不按接口号。
+    # 三个常量也取自 identity：导出名跟着设备事实走，不落回基类默认值。
+    interface_class_hid = identity.INTERFACE_CLASS_HID
+    keyboard_interface_subclass = identity.KEYBOARD_INTERFACE_SUBCLASS
+    keyboard_interface_protocol = identity.KEYBOARD_INTERFACE_PROTOCOL
+
     def is_keyboard_interface(self, setting):
         return identity.is_keyboard_interface(setting)
 
